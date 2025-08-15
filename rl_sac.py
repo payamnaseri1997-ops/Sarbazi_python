@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+import json
 
 class ResidualAgentAPI:  # minimal duck-typing to satisfy main
     def act(self, obs, eval: bool=False) -> float: ...
