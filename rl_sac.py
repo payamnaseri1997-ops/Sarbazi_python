@@ -28,7 +28,12 @@ class ResidualAgentAPI:  # minimal duck-typing to satisfy main
     def save(self, name: str, out_dir: str = "agents"): ...
 
 class MLP(nn.Module):
-    def __init__(self, inp, out, hidden=(128,128), act=nn.ReLU):
+    def __init__(self, inp, out, hidden=(32,32), act=nn.ReLU):
+        """Simple multi-layer perceptron.
+
+        The default hidden sizes were reduced from (128,128) to (32,32)
+        to keep the actor and critic lightweight as requested.
+        """
         super().__init__()
         layers = []
         last = inp
@@ -43,7 +48,8 @@ class MLP(nn.Module):
 class Actor(nn.Module):
     def __init__(self, obs_dim, act_dim, u_max):
         super().__init__()
-        self.body = MLP(obs_dim, 2*act_dim)
+        # Use a small network with two 32-unit hidden layers
+        self.body = MLP(obs_dim, 2*act_dim, hidden=(32,32))
         self.u_max = float(u_max)
     def forward(self, x):
         mu_logstd = self.body(x)
@@ -61,7 +67,8 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super().__init__()
-        self.q = MLP(obs_dim + act_dim, 1)
+        # Mirror actor size for both Q-functions
+        self.q = MLP(obs_dim + act_dim, 1, hidden=(32,32))
     def forward(self, obs, act):
         return self.q(torch.cat([obs, act], dim=-1))
 
@@ -94,7 +101,7 @@ class ReplayBuffer:
 
 @dataclass
 class SACConfig:
-    u_rl_max: float = 0.18     # residual torque bound
+    u_rl_max: float = 0.16     # residual torque bound (≈20% of SMC torque limit)
     gamma: float = 0.997       # discount
     tau: float = 0.005         # target smoothing
     lr: float = 3e-4           # learning rate

@@ -512,8 +512,11 @@ def train_and_save(
     np.random.seed(seed)
     plant = OneDOFRotorPlant(plant_p)
 
+    # Residual policy limited to 20% of the SMC torque bounds
+    u_rl_max = 0.2 * plant_p.u_max
+
     if agent_type == 'simple':
-        agent = make_agent('simple', u_rl_max=0.18)
+        agent = make_agent('simple', u_rl_max=u_rl_max)
         # Use episodic training; do N episodes
         dt = plant.p.dt
         steps_per_ep = int(round(task.horizon_s / dt))
@@ -529,7 +532,7 @@ def train_and_save(
         print(f"Saved SIMPLE agent as '{agent_name}' in ./{AGENTS_DIR}")
 
     elif agent_type == 'sac':
-        agent = make_agent('sac', u_rl_max=0.18)
+        agent = make_agent('sac', u_rl_max=u_rl_max)
         dt = plant.p.dt
         steps_per_ep = int(round(task.horizon_s / dt))
         print(f"Training SAC residual RL until {total_steps} transitions...")
@@ -577,10 +580,10 @@ def evaluate_and_rollout(
 
     # Recreate agent and load weights
     if a_type == 'simple':
-        agent = make_agent('simple', u_rl_max=meta.get('u_rl_max', 0.18))
+        agent = make_agent('simple', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
         agent.load(agent_name, in_dir=AGENTS_DIR)
     elif a_type == 'sac':
-        agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', 0.18))
+        agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
         agent.load(agent_name, in_dir=AGENTS_DIR)
     else:
         raise ValueError(f"Unknown agent type in meta: {a_type}")
