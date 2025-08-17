@@ -28,7 +28,7 @@ class RLConfig:
     lr: float = 1e-3           # learning rate for weight updates
     sigma: float = 0.1         # exploration std (Nm)
     gamma: float = 0.995       # return discount factor
-    u_rl_max: float = 0.18     # residual torque bound
+    u_rl_max: float = 0.16     # residual torque bound (≈20% of SMC torque limit)
     feature_clip: float = 5.0  # clip features to stabilize
 
 class SimpleResidualPolicy(ResidualAgentAPI):
@@ -92,10 +92,13 @@ class SimpleResidualPolicy(ResidualAgentAPI):
     def save(self, name: str, out_dir: str = "agents"):
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{name}_simple.npz")
-        np.savez(path, w=self.w, cfg=np.array([self.cfg.lr, self.cfg.sigma, self.cfg.gamma, self.cfg.u_rl_max, self.cfg.feature_clip], dtype=np.float32))
-        with open(os.path.join(out_dir, f"{name}_simple.readme.txt"), 'w') as f:
-            f.write("Linear residual policy (REINFORCE). Keys: w, cfg=[lr,sigma,gamma,u_rl_max,feature_clip]
-")
+        np.savez(
+            path,
+            w=self.w,
+            cfg=np.array([self.cfg.lr, self.cfg.sigma, self.cfg.gamma, self.cfg.u_rl_max, self.cfg.feature_clip], dtype=np.float32),
+        )
+        with open(os.path.join(out_dir, f"{name}_simple.readme.txt"), "w") as f:
+            f.write("Linear residual policy (REINFORCE). Keys: w, cfg=[lr,sigma,gamma,u_rl_max,feature_clip]")
 
     def load(self, name: str, in_dir: str = "agents"):
         path = os.path.join(in_dir, f"{name}_simple.npz")
