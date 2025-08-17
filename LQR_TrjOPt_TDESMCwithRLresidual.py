@@ -63,7 +63,9 @@ class OneDOFRotorPlant:
 
     State: x = [theta, omega]
     Dynamics: J * domega = u - b*omega + d(t)
-    Disturbance d(t) includes Coulomb friction, periodic load, and white torque noise.
+    Disturbance d(t) includes Coulomb friction, periodic load, an additional
+    sinusoid with time-varying amplitude and frequency (to mimic unmodeled
+    dynamics), and white torque noise.
     """
     def __init__(self, p: PlantParams):
         self.p = p
@@ -73,6 +75,13 @@ class OneDOFRotorPlant:
         self.load_amp = 0.03        # Nm
         self.load_freq = 1.5        # Hz
         self.noise_std = 0.01       # Nm
+        # Additional unmodeled disturbance with varying amplitude/frequency
+        self.extra_base_amp = 0.02  # Nm
+        self.extra_base_freq = 2.0  # Hz
+        self.extra_amp_mod = 0.5    # relative amplitude variation
+        self.extra_amp_mod_freq = 0.1  # Hz, amplitude modulation frequency
+        self.extra_freq_mod = 0.5   # relative frequency variation
+        self.extra_freq_mod_freq = 0.05  # Hz, frequency modulation frequency
         self.time = 0.0
 
     def reset(self, theta0: float = 0.0, omega0: float = 0.0) -> np.ndarray:
@@ -95,8 +104,19 @@ class OneDOFRotorPlant:
         # Disturbances
         d_coul = self.torque_coulomb * (1.0 if omega >= 0 else -1.0) if abs(omega) > 1e-5 else 0.0
         d_per = self.load_amp * math.sin(2.0 * math.pi * self.load_freq * self.time)
+        amp_var = self.extra_base_amp * (
+            1.0
+            + self.extra_amp_mod
+            * math.sin(2.0 * math.pi * self.extra_amp_mod_freq * self.time)
+        )
+        freq_var = self.extra_base_freq * (
+            1.0
+            + self.extra_freq_mod
+            * math.sin(2.0 * math.pi * self.extra_freq_mod_freq * self.time)
+        )
+        d_var = amp_var * math.sin(2.0 * math.pi * freq_var * self.time)
         d_noise = np.random.randn() * self.noise_std
-        d = d_coul + d_per + d_noise
+        d = d_coul + d_per + d_var + d_noise
 
         # Dynamics integration (semi-implicit Euler)
         domega = (u - self.p.b * omega + d) / self.p.J
