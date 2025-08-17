@@ -138,6 +138,7 @@ class LQRWeights:
     r_u: float = 0.01          # control effort weight
     qT_theta: float = 2000.0   # terminal angle weight
     qT_omega: float = 50.0     # terminal speed weight
+    omega_limit_penalty: float = 1000.0  # extra penalty for |omega| beyond limit
 
 def build_AB(nom: NominalModel, dt: float) -> Tuple[np.ndarray, np.ndarray]:
     """Discrete-time linear model x_{k+1} = A x_k + B u_k for x=[theta, omega]."""
@@ -174,7 +175,7 @@ def generate_reference_ilqr_like(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate a feasible reference (x_ref, u_ref) using finite-horizon LQR on nominal model.
     - Torque is clamped to u_max (hard input constraint).
-    - Speed/other soft constraints are encoded through Q/Qf.
+    - Speed beyond omega_max is penalized with omega_limit_penalty.
     Returns:
       x_ref: (N+1, 2) states [theta, omega]
       u_ref: (N,) torque sequence
@@ -188,6 +189,9 @@ def generate_reference_ilqr_like(
     x = x0.copy()
     for k in range(N):
         x_tilde = x - x_goal
+        excess = abs(x[1]) - plant_limits.omega_max
+        if excess > 0:
+            x_tilde[1] += w.omega_limit_penalty * excess * math.copysign(1.0, x[1])
         u = float(-Ks[k] @ x_tilde.reshape(2, 1))
         u = sat(u, plant_limits.u_max)
         x = A @ x + B.flatten() * u
@@ -285,11 +289,19 @@ class CostConfig:
 
 @dataclass
 class Task:
-    """Task specification: start, goal and time horizon."""
+    """Task specification: start and goal for one episode."""
     theta0: float
     omega0: float
     theta_goal: float
-    horizon_s: float
+
+
+def time_horizon(theta0: float, theta_goal: float) -> float:
+    """Compute time horizon based on angular difference.
+
+    The horizon scales linearly with |θ_goal−θ_0| such that a π radian
+    move takes 4 seconds and a π/2 radian move takes 2 seconds.
+    """
+    return 4.0 * abs(theta_goal - theta0) / math.pi
 
 # -------------------------
 # RL Agent API (minimal interface that both SIMPLE and SAC implement)
@@ -337,7 +349,8 @@ def rollout_once(
     """
     np.random.seed(seed)
     dt = plant.p.dt
-    N = int(round(task.horizon_s / dt))
+    horizon_s = time_horizon(task.theta0, task.theta_goal)
+    N = int(round(horizon_s / dt))
 
     # Reference trajectory on nominal model
     x0 = np.array([task.theta0, task.omega0], dtype=float)
@@ -519,7 +532,8 @@ def train_and_save(
         agent = make_agent('simple', u_rl_max=u_rl_max)
         # Use episodic training; do N episodes
         dt = plant.p.dt
-        steps_per_ep = int(round(task.horizon_s / dt))
+        horizon_s = time_horizon(task.theta0, task.theta_goal)
+        steps_per_ep = int(round(horizon_s / dt))
         n_episodes = max(1, total_steps // steps_per_ep)
         print(f"Training SIMPLE residual RL for {n_episodes} episodes...")
         for ep in range(1, n_episodes + 1):
@@ -534,7 +548,8 @@ def train_and_save(
     elif agent_type == 'sac':
         agent = make_agent('sac', u_rl_max=u_rl_max)
         dt = plant.p.dt
-        steps_per_ep = int(round(task.horizon_s / dt))
+        horizon_s = time_horizon(task.theta0, task.theta_goal)
+        steps_per_ep = int(round(horizon_s / dt))
         print(f"Training SAC residual RL until {total_steps} transitions...")
         ep = 0
         while getattr(agent, 'replay').len < total_steps:
@@ -557,7 +572,6 @@ def evaluate_and_rollout(
     agent_name: str,
     theta0: float,
     theta_goal: float,
-    horizon_s: float,
     plant_p: PlantParams,
     nom: NominalModel,
     lqr_w: LQRWeights,
@@ -588,7 +602,7 @@ def evaluate_and_rollout(
     else:
         raise ValueError(f"Unknown agent type in meta: {a_type}")
 
-    task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal, horizon_s=horizon_s)
+    task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     plant = OneDOFRotorPlant(plant_p)
     metrics, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed, collect_logs=True)
     logs['metrics'] = metrics
@@ -613,18 +627,18 @@ if __name__ == "__main__":
     # 1) Train and save a SIMPLE agent
     # train_and_save(agent_name="demo_simple", agent_type='simple',
     #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90), horizon_s=1.2),
+    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90)),
     #               cost_cfg=cost_cfg, total_steps=30000)
 
     # 2) Train and save a SAC agent
     # train_and_save(agent_name="demo_sac", agent_type='sac',
     #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90), horizon_s=1.2),
+    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90)),
     #               cost_cfg=cost_cfg, total_steps=60000)
 
     # 3) Evaluate a saved agent and get all logs
     # logs = evaluate_and_rollout(
-    #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60), horizon_s=1.2,
+    #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60),
     #     plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg, cost_cfg=cost_cfg)
     # print("Keys in logs:", list(logs.keys()))
 
