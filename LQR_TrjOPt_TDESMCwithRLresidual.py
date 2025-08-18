@@ -530,17 +530,21 @@ def train_and_save(
 
     if agent_type == 'simple':
         agent = make_agent('simple', u_rl_max=u_rl_max)
-        # Use episodic training; do N episodes
         dt = plant.p.dt
-        horizon_s = time_horizon(task.theta0, task.theta_goal)
-        steps_per_ep = int(round(horizon_s / dt))
-        n_episodes = max(1, total_steps // steps_per_ep)
-        print(f"Training SIMPLE residual RL for {n_episodes} episodes...")
-        for ep in range(1, n_episodes + 1):
-            _, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=ep, collect_logs=False)
+        min_goal, max_goal = -abs(task.theta_goal), abs(task.theta_goal)
+        print(f"Training SIMPLE residual RL for up to {total_steps} steps...")
+        steps_done = 0
+        ep = 0
+        while steps_done < total_steps:
+            ep += 1
+            goal = np.random.uniform(min_goal, max_goal)
+            random_task = Task(theta0=task.theta0, omega0=task.omega0, theta_goal=goal)
+            horizon_s = time_horizon(random_task.theta0, random_task.theta_goal)
+            steps_per_ep = int(round(horizon_s / dt))
+            _, _ = rollout_once(plant, nom, random_task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False)
+            steps_done += steps_per_ep
             if ep % 10 == 0:
                 print(f"Ep {ep}")
-        # Save model and meta
         agent.save(agent_name, out_dir=AGENTS_DIR)
         save_meta(agent_name, {"type": "simple", "u_rl_max": agent.cfg.u_rl_max})
         print(f"Saved SIMPLE agent as '{agent_name}' in ./{AGENTS_DIR}")
@@ -548,13 +552,15 @@ def train_and_save(
     elif agent_type == 'sac':
         agent = make_agent('sac', u_rl_max=u_rl_max)
         dt = plant.p.dt
-        horizon_s = time_horizon(task.theta0, task.theta_goal)
-        steps_per_ep = int(round(horizon_s / dt))
+        min_goal, max_goal = -abs(task.theta_goal), abs(task.theta_goal)
         print(f"Training SAC residual RL until {total_steps} transitions...")
         ep = 0
         while getattr(agent, 'replay').len < total_steps:
             ep += 1
-            metrics, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False)
+            goal = np.random.uniform(min_goal, max_goal)
+            random_task = Task(theta0=task.theta0, omega0=task.omega0, theta_goal=goal)
+            horizon_s = time_horizon(random_task.theta0, random_task.theta_goal)
+            metrics, _ = rollout_once(plant, nom, random_task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False)
             if ep % 5 == 0:
                 buf_len = getattr(agent, 'replay').len
                 print(f"Ep {ep:03d}: cost={metrics['total_cost']:.4f}, finished={int(metrics['finished'])}, buffer={buf_len}")
