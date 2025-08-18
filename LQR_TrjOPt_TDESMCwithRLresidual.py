@@ -579,7 +579,11 @@ def evaluate_and_rollout(
     cost_cfg: CostConfig,
     seed: int = 123
 ) -> Dict[str, np.ndarray]:
-    """Load saved agent by `agent_name`, simulate one rollout, and return arrays.
+    """Simulate one rollout using a saved agent or pure TDE SMC.
+
+    If ``agent_name`` is ``'none'`` (case-insensitive) the rollout uses the
+    TDE SMC controller without any residual RL action.  Otherwise the function
+    loads the specified agent and includes its residual control.
 
     Returns a dictionary with arrays (each length ~ steps):
       - 't' : time [s]
@@ -589,18 +593,20 @@ def evaluate_and_rollout(
       - 'u_rl'                           (RL residual)
       - 'u_total'                        (applied torque)
     """
-    meta = load_meta(agent_name)
-    a_type = meta.get('type')
+    agent: Optional[ResidualAgentAPI] = None
+    if agent_name is not None and agent_name.lower() != 'none':
+        meta = load_meta(agent_name)
+        a_type = meta.get('type')
 
-    # Recreate agent and load weights
-    if a_type == 'simple':
-        agent = make_agent('simple', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
-        agent.load(agent_name, in_dir=AGENTS_DIR)
-    elif a_type == 'sac':
-        agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
-        agent.load(agent_name, in_dir=AGENTS_DIR)
-    else:
-        raise ValueError(f"Unknown agent type in meta: {a_type}")
+        # Recreate agent and load weights
+        if a_type == 'simple':
+            agent = make_agent('simple', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
+            agent.load(agent_name, in_dir=AGENTS_DIR)
+        elif a_type == 'sac':
+            agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
+            agent.load(agent_name, in_dir=AGENTS_DIR)
+        else:
+            raise ValueError(f"Unknown agent type in meta: {a_type}")
 
     task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     plant = OneDOFRotorPlant(plant_p)
@@ -619,6 +625,133 @@ def default_params():
     smc_cfg = SMCConfig(lambda_s=40.0, k=0.8, phi=0.03, delay_steps=3)
     cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
+
+
+def plot_rollout_and_errors(agent_name: str, theta0: float, theta_goal: float) -> None:
+    """Plot trajectories and errors for an agent or pure TDE SMC.
+
+    If ``agent_name`` is ``'none'`` the function plots only the TDE SMC
+    trajectory.  Otherwise it compares the agent-augmented controller against a
+    pure TDE SMC baseline.  In both cases the initial and goal angles are
+    indicated and the total cost is printed.
+    """
+    import matplotlib.pyplot as plt
+
+    plant_p, nom, lqr_w, smc_cfg, cost_cfg = default_params()
+
+    # Pure TDE SMC only
+    if agent_name is None or agent_name.lower() == 'none':
+        logs_smc = evaluate_and_rollout(
+            agent_name='none',
+            theta0=theta0,
+            theta_goal=theta_goal,
+            plant_p=plant_p,
+            nom=nom,
+            lqr_w=lqr_w,
+            smc_cfg=smc_cfg,
+            cost_cfg=cost_cfg,
+        )
+        print(f"TDE SMC total cost: {logs_smc['metrics']['total_cost']:.3f}")
+
+        plt.figure()
+        plt.plot(logs_smc['t'], logs_smc['theta'], label='SMC-only θ')
+        plt.plot(logs_smc['t'], logs_smc['theta_ref'], '--', label='Reference θ')
+        plt.axhline(theta0, color='k', linestyle=':', label='θ₀')
+        plt.axhline(theta_goal, color='k', linestyle='-.', label='θ goal')
+        plt.xlabel('Time [s]')
+        plt.ylabel('θ [rad]')
+        plt.legend()
+        plt.tight_layout()
+
+        plt.figure()
+        plt.plot(
+            logs_smc['t'],
+            logs_smc['theta'] - logs_smc['theta_ref'],
+            label='SMC error',
+        )
+        plt.xlabel('Time [s]')
+        plt.ylabel('Tracking error [rad]')
+        plt.legend()
+        plt.tight_layout()
+
+        plt.figure()
+        plt.plot(
+            logs_smc['t'],
+            logs_smc['omega'] - logs_smc['omega_ref'],
+            label='SMC ω error',
+        )
+        plt.xlabel('Time [s]')
+        plt.ylabel('Velocity error [rad/s]')
+        plt.legend()
+        plt.tight_layout()
+
+        plt.show()
+        return
+
+    # Agent vs. TDE SMC comparison
+    logs_agent = evaluate_and_rollout(
+        agent_name=agent_name,
+        theta0=theta0,
+        theta_goal=theta_goal,
+        plant_p=plant_p,
+        nom=nom,
+        lqr_w=lqr_w,
+        smc_cfg=smc_cfg,
+        cost_cfg=cost_cfg,
+    )
+    print(f"Agent total cost: {logs_agent['metrics']['total_cost']:.3f}")
+
+    plant = OneDOFRotorPlant(plant_p)
+    task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
+    metrics_smc, logs_smc = rollout_once(
+        plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, collect_logs=True
+    )
+    print(f"TDE SMC total cost: {metrics_smc['total_cost']:.3f}")
+
+    plt.figure()
+    plt.plot(logs_agent['t'], logs_agent['theta'], label='RL+SMC θ')
+    plt.plot(logs_agent['t'], logs_agent['theta_ref'], '--', label='Reference θ')
+    plt.plot(logs_smc['t'], logs_smc['theta'], label='SMC-only θ')
+    plt.axhline(theta0, color='k', linestyle=':', label='θ₀')
+    plt.axhline(theta_goal, color='k', linestyle='-.', label='θ goal')
+    plt.xlabel('Time [s]')
+    plt.ylabel('θ [rad]')
+    plt.legend()
+    plt.tight_layout()
+
+    plt.figure()
+    plt.plot(
+        logs_agent['t'],
+        logs_agent['theta'] - logs_agent['theta_ref'],
+        label='Agent error',
+    )
+    plt.plot(
+        logs_smc['t'],
+        logs_smc['theta'] - logs_smc['theta_ref'],
+        label='SMC error',
+    )
+    plt.xlabel('Time [s]')
+    plt.ylabel('Tracking error [rad]')
+    plt.legend()
+    plt.tight_layout()
+
+    plt.figure()
+    plt.plot(
+        logs_agent['t'],
+        logs_agent['omega'] - logs_agent['omega_ref'],
+        label='Agent ω error',
+    )
+    plt.plot(
+        logs_smc['t'],
+        logs_smc['omega'] - logs_smc['omega_ref'],
+        label='SMC ω error',
+    )
+    plt.xlabel('Time [s]')
+    plt.ylabel('Velocity error [rad/s]')
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
 
 if __name__ == "__main__":
     # === Example usage ===
@@ -641,4 +774,14 @@ if __name__ == "__main__":
     #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60),
     #     plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg, cost_cfg=cost_cfg)
     # print("Keys in logs:", list(logs.keys()))
+
+    # 4) Plot agent rollout against pure TDE SMC and show errors
+    # plot_rollout_and_errors(
+    #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60)
+    # )
+
+    # 5) Plot only TDE SMC (no agent residual)
+    # plot_rollout_and_errors(
+    #     agent_name="none", theta0=0.0, theta_goal=math.radians(60)
+    # )
 
