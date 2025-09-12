@@ -83,6 +83,7 @@ class OneDOFRotorPlant:
         self.extra_freq_mod = 0.5   # relative frequency variation
         self.extra_freq_mod_freq = 0.05  # Hz, frequency modulation frequency
         self.time = 0.0
+        self.last_disturbance = 0.0
 
     def reset(self, theta0: float = 0.0, omega0: float = 0.0) -> np.ndarray:
         """Reset the plant state.
@@ -92,6 +93,7 @@ class OneDOFRotorPlant:
         """
         self.state[:] = [theta0, omega0]
         self.time = 0.0
+        self.last_disturbance = 0.0
         return self.state.copy()
 
     def step(self, u_cmd: float) -> np.ndarray:
@@ -117,6 +119,7 @@ class OneDOFRotorPlant:
         d_var = amp_var * math.sin(2.0 * math.pi * freq_var * self.time)
         d_noise = np.random.randn() * self.noise_std
         d = d_coul + d_per + d_var + d_noise
+        self.last_disturbance = d
 
         # Dynamics integration (semi-implicit Euler)
         domega = (u - self.p.b * omega + d) / self.p.J
@@ -345,7 +348,8 @@ def rollout_once(
       metrics: dict with total_cost, finished (0/1), time
       logs (if collect_logs=True): dict of arrays with keys:
         't', 'theta_ref', 'omega_ref', 'alpha_ref', 'theta', 'omega',
-        'u_rl', 'u_eq', 'u_s', 'd_hat', 'u_smc', 'u_total'
+        'u_rl', 'u_eq', 'u_s', 'd_hat', 'u_tde', 'u_smc', 'u_total',
+        'disturbance'
     """
     np.random.seed(seed)
     dt = plant.p.dt
@@ -376,8 +380,10 @@ def rollout_once(
         u_eq_log = np.zeros(N)
         u_s_log = np.zeros(N)
         d_hat_log = np.zeros(N)
+        u_tde_log = np.zeros(N)
         u_smc_log = np.zeros(N)
         u_total_log = np.zeros(N)
+        dist_log = np.zeros(N)
 
     total_cost = 0.0
     done = False
@@ -443,8 +449,10 @@ def rollout_once(
             u_eq_log[k] = info['u_eq']
             u_s_log[k] = info['u_s']
             d_hat_log[k] = info['d_hat']
+            u_tde_log[k] = -info['d_hat']
             u_smc_log[k] = info['u_smc']
             u_total_log[k] = u_cmd
+            dist_log[k] = plant.last_disturbance
 
         if done:
             break
@@ -460,7 +468,8 @@ def rollout_once(
             t=t_log[:k+1], theta_ref=th_ref_log[:k+1], omega_ref=om_ref_log[:k+1], alpha_ref=al_ref_log[:k+1],
             theta=th_log[:k+1], omega=om_log[:k+1],
             u_rl=u_rl_log[:k+1], u_eq=u_eq_log[:k+1], u_s=u_s_log[:k+1], d_hat=d_hat_log[:k+1],
-            u_smc=u_smc_log[:k+1], u_total=u_total_log[:k+1]
+            u_tde=u_tde_log[:k+1], u_smc=u_smc_log[:k+1], u_total=u_total_log[:k+1],
+            disturbance=dist_log[:k+1]
         )
     return metrics, logs
 
@@ -595,9 +604,9 @@ def evaluate_and_rollout(
       - 't' : time [s]
       - 'theta_ref', 'omega_ref', 'alpha_ref'
       - 'theta', 'omega'                (actual plant)
-      - 'u_eq', 'd_hat', 'u_s', 'u_smc' (SMC/TDE components)
+      - 'u_eq', 'd_hat', 'u_tde', 'u_s', 'u_smc' (SMC/TDE components)
       - 'u_rl'                           (RL residual)
-      - 'u_total'                        (applied torque)
+      - 'u_total', 'disturbance'        (applied torque & actual disturbance)
     """
     agent: Optional[ResidualAgentAPI] = None
     if agent_name is not None and agent_name.lower() != 'none':
@@ -790,4 +799,39 @@ if __name__ == "__main__":
     # plot_rollout_and_errors(
     #     agent_name="none", theta0=0.0, theta_goal=math.radians(60)
     # )
+
+    # 6) Run a rollout with pure TDE SMC and plot key signals
+    plant = OneDOFRotorPlant(plant_p)
+    task = Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(60))
+    _, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, seed=0, collect_logs=True)
+
+    import matplotlib.pyplot as plt
+    t = logs['t']
+
+    # plot theta and theta_ref
+    plt.figure()
+    plt.plot(t, logs['theta'], label='theta')
+    plt.plot(t, logs['theta_ref'], '--', label='theta_ref')
+    plt.xlabel('Time [s]')
+    plt.ylabel('Theta [rad]')
+    plt.legend()
+
+    # plot remaining signals vs time
+    fig, axs = plt.subplots(3, 1, sharex=True)
+    axs[0].plot(t, logs['omega'], label='theta_dot')
+    axs[0].plot(t, logs['omega_ref'], '--', label='theta_dot_ref')
+    axs[0].set_ylabel('rad/s')
+    axs[0].legend()
+
+    axs[1].plot(t, logs['u_smc'], label='u_smc')
+    axs[1].plot(t, logs['u_tde'], label='u_TDE')
+    axs[1].plot(t, logs['u_rl'], label='u_rl')
+    axs[1].set_ylabel('Torque [Nm]')
+    axs[1].legend()
+
+    axs[2].plot(t, logs['disturbance'], label='disturbance')
+    axs[2].set_ylabel('Torque [Nm]')
+    axs[2].set_xlabel('Time [s]')
+    axs[2].legend()
+    plt.show()
 
