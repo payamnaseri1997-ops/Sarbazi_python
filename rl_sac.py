@@ -12,6 +12,7 @@ Created on Sat Aug 16 01:14:25 2025
 Provides save()/load() so it can be persisted and reused by name.
 """
 from dataclasses import dataclass
+from typing import Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,10 +47,10 @@ class MLP(nn.Module):
         return self.net(x)
 
 class Actor(nn.Module):
-    def __init__(self, obs_dim, act_dim, u_max):
+    def __init__(self, obs_dim, act_dim, u_max, hidden_sizes=(32,32)):
         super().__init__()
-        # Use a small network with two 32-unit hidden layers
-        self.body = MLP(obs_dim, 2*act_dim, hidden=(32,32))
+        # Network size can be customized via hidden_sizes
+        self.body = MLP(obs_dim, 2*act_dim, hidden=hidden_sizes)
         self.u_max = float(u_max)
     def forward(self, x):
         mu_logstd = self.body(x)
@@ -65,10 +66,10 @@ class Actor(nn.Module):
         return a_scaled, logp, mu.tanh()*self.u_max
 
 class Critic(nn.Module):
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, hidden_sizes=(32,32)):
         super().__init__()
         # Mirror actor size for both Q-functions
-        self.q = MLP(obs_dim + act_dim, 1, hidden=(32,32))
+        self.q = MLP(obs_dim + act_dim, 1, hidden=hidden_sizes)
     def forward(self, obs, act):
         return self.q(torch.cat([obs, act], dim=-1))
 
@@ -110,6 +111,7 @@ class SACConfig:
     updates_per_step: int = 1  # gradient steps per env step
     alpha: float = 0.2         # initial temperature
     autotune_alpha: bool = True
+    hidden_sizes: Tuple[int, ...] = (32, 32)
 
 class SACResidualPolicy(ResidualAgentAPI):
     """Soft Actor-Critic residual policy. Actions are tanh-squashed and scaled to ±u_rl_max.
@@ -118,11 +120,13 @@ class SACResidualPolicy(ResidualAgentAPI):
     def __init__(self, obs_dim: int, act_dim: int, cfg: SACConfig):
         self.device = torch.device('cpu')
         self.cfg = cfg
-        self.actor = Actor(obs_dim, act_dim, cfg.u_rl_max).to(self.device)
-        self.q1 = Critic(obs_dim, act_dim).to(self.device)
-        self.q2 = Critic(obs_dim, act_dim).to(self.device)
-        self.q1_t = Critic(obs_dim, act_dim).to(self.device)
-        self.q2_t = Critic(obs_dim, act_dim).to(self.device)
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.actor = Actor(obs_dim, act_dim, cfg.u_rl_max, cfg.hidden_sizes).to(self.device)
+        self.q1 = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
+        self.q2 = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
+        self.q1_t = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
+        self.q2_t = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
         self.q1_t.load_state_dict(self.q1.state_dict())
         self.q2_t.load_state_dict(self.q2.state_dict())
         self.pi_optim = optim.Adam(self.actor.parameters(), lr=cfg.lr)
@@ -213,12 +217,30 @@ class SACResidualPolicy(ResidualAgentAPI):
         torch.save(self.q1.state_dict(),    os.path.join(out_dir, f"{name}_sac_q1.pth"))
         torch.save(self.q2.state_dict(),    os.path.join(out_dir, f"{name}_sac_q2.pth"))
         meta = dict(cfg={k: float(getattr(self.cfg, k)) if isinstance(getattr(self.cfg, k), float) else getattr(self.cfg, k)
-                          for k in ['u_rl_max','gamma','tau','lr','batch_size','start_steps','updates_per_step','alpha','autotune_alpha']})
+                          for k in ['u_rl_max','gamma','tau','lr','batch_size','start_steps','updates_per_step','alpha','autotune_alpha','hidden_sizes']})
+        # ensure hidden_sizes stored as list for JSON
+        meta['cfg']['hidden_sizes'] = list(self.cfg.hidden_sizes)
         with open(os.path.join(out_dir, f"{name}_sac_meta.json"), 'w') as f:
             json.dump(meta, f, indent=2)
 
     def load(self, name: str, in_dir: str = "agents"):
+        meta_path = os.path.join(in_dir, f"{name}_sac_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            saved_hs = tuple(meta.get('cfg', {}).get('hidden_sizes', self.cfg.hidden_sizes))
+        else:
+            saved_hs = self.cfg.hidden_sizes
+        if saved_hs != self.cfg.hidden_sizes:
+            self.cfg.hidden_sizes = saved_hs
+            self.actor = Actor(self.obs_dim, self.act_dim, self.cfg.u_rl_max, saved_hs).to(self.device)
+            self.q1 = Critic(self.obs_dim, self.act_dim, saved_hs).to(self.device)
+            self.q2 = Critic(self.obs_dim, self.act_dim, saved_hs).to(self.device)
+            self.q1_t = Critic(self.obs_dim, self.act_dim, saved_hs).to(self.device)
+            self.q2_t = Critic(self.obs_dim, self.act_dim, saved_hs).to(self.device)
         self.actor.load_state_dict(torch.load(os.path.join(in_dir, f"{name}_sac_actor.pth"), map_location='cpu'))
         self.q1.load_state_dict(torch.load(os.path.join(in_dir, f"{name}_sac_q1.pth"), map_location='cpu'))
         self.q2.load_state_dict(torch.load(os.path.join(in_dir, f"{name}_sac_q2.pth"), map_location='cpu'))
+        self.q1_t.load_state_dict(self.q1.state_dict())
+        self.q2_t.load_state_dict(self.q2.state_dict())
         # critics are not needed for pure evaluation but loading keeps coherence
