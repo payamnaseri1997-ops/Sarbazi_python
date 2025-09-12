@@ -495,16 +495,17 @@ def load_meta(name: str) -> Dict:
         return json.load(f)
 
 
-def make_agent(agent_type: str, u_rl_max: float) -> ResidualAgentAPI:
+def make_agent(agent_type: str, u_rl_max: float, hidden_sizes: Tuple[int, ...] = (32, 32)) -> ResidualAgentAPI:
     """Factory: create an untrained residual agent of given type.
     agent_type: 'simple' or 'sac'
     u_rl_max: residual torque bound (magnitude)
+    hidden_sizes: network layer sizes for SAC agent
     """
     if agent_type == 'simple':
         cfg = SimpleRLConfig(u_rl_max=u_rl_max)
         return SimpleResidualPolicy(n_features=6, cfg=cfg)
     elif agent_type == 'sac':
-        cfg = SACConfig(u_rl_max=u_rl_max)
+        cfg = SACConfig(u_rl_max=u_rl_max, hidden_sizes=hidden_sizes)
         return SACResidualPolicy(obs_dim=6, act_dim=1, cfg=cfg)
     else:
         raise ValueError("agent_type must be 'simple' or 'sac'")
@@ -574,7 +575,7 @@ def train_and_save(
                 buf_len = getattr(agent, 'replay').len
                 print(f"Ep {ep:03d}: cost={metrics['total_cost']:.4f}, finished={int(metrics['finished'])}, buffer={buf_len}")
         agent.save(agent_name, out_dir=AGENTS_DIR)
-        save_meta(agent_name, {"type": "sac", "u_rl_max": agent.cfg.u_rl_max})
+        save_meta(agent_name, {"type": "sac", "u_rl_max": agent.cfg.u_rl_max, "hidden_sizes": list(agent.cfg.hidden_sizes)})
         print(f"Saved SAC agent as '{agent_name}' in ./{AGENTS_DIR}")
     else:
         raise ValueError("agent_type must be 'simple' or 'sac'")
@@ -618,7 +619,8 @@ def evaluate_and_rollout(
             agent = make_agent('simple', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
             agent.load(agent_name, in_dir=AGENTS_DIR)
         elif a_type == 'sac':
-            agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2))
+            hs = tuple(meta.get('hidden_sizes', (32, 32)))
+            agent = make_agent('sac', u_rl_max=meta.get('u_rl_max', plant_p.u_max * 0.2), hidden_sizes=hs)
             agent.load(agent_name, in_dir=AGENTS_DIR)
         else:
             raise ValueError(f"Unknown agent type in meta: {a_type}")
