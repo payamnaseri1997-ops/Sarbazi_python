@@ -339,28 +339,108 @@ def rollout_once(
     smc_cfg: SMCConfig,
     agent: Optional[ResidualAgentAPI],
     cost_cfg: CostConfig,
+    reference: Optional[Dict[str, object]] = None,
     seed: int = 0,
     collect_logs: bool = False,
 ):
     """Run one episode. If agent is None, runs SMC without residual.
+
+    Parameters
+    ----------
+    reference : Optional[Dict[str, object]]
+        When provided, overrides the default iLQR trajectory with a custom
+        reference profile.  Supported options include:
+          - ``{"kind": "constant"}`` to hold the goal angle constant.
+          - ``{"kind": "piecewise_quad", "tm_frac": 0.4}`` for the
+            piecewise quadratic profile shown in the user snippet.
+          - ``{"theta": array_like}`` to directly specify the angle sequence
+            (length ``N`` or ``N+1``) used as the reference.
 
     Returns (metrics, logs)
       metrics: dict with total_cost, finished (0/1), time
       logs (if collect_logs=True): dict of arrays with keys:
         't', 'theta_ref', 'omega_ref', 'alpha_ref', 'theta', 'omega',
         'u_rl', 'u_eq', 'u_s', 'd_hat', 'u_tde', 'u_smc', 'u_total',
-        'disturbance'
+        'disturbance', 'reference_kind'
     """
     np.random.seed(seed)
     dt = plant.p.dt
     horizon_s = time_horizon(task.theta0, task.theta_goal)
     N = int(round(horizon_s / dt))
 
-    # Reference trajectory on nominal model
-    x0 = np.array([task.theta0, task.omega0], dtype=float)
-    xg = np.array([task.theta_goal, 0.0], dtype=float)
-    x_ref, _ = generate_reference_ilqr_like(nom, plant.p, x0, xg, N=N, dt=dt, w=lqr_w)
-    theta_ref = np.concatenate([[task.theta0], x_ref[:-1, 0]])
+    # Reference trajectory: optimized iLQR by default, optional custom profiles otherwise
+    ref_opts = {} if reference is None else dict(reference)
+    ref_kind_input = ref_opts.get('kind', 'ilqr')
+    ref_kind_lower = str(ref_kind_input).lower() if ref_kind_input is not None else 'ilqr'
+    has_theta_sequence = 'theta' in ref_opts
+
+    use_ilqr_reference = (not has_theta_sequence) and (ref_kind_lower in ('ilqr', 'optimized', 'lqr'))
+
+    if N > 0:
+        t_nodes = np.arange(N + 1, dtype=float) * dt
+        T = t_nodes[-1]
+    else:
+        t_nodes = np.zeros(1, dtype=float)
+        T = 0.0
+
+    if use_ilqr_reference:
+        reference_kind = 'ilqr'
+        x0 = np.array([task.theta0, task.omega0], dtype=float)
+        xg = np.array([task.theta_goal, 0.0], dtype=float)
+        x_ref, _ = generate_reference_ilqr_like(nom, plant.p, x0, xg, N=N, dt=dt, w=lqr_w)
+        theta_ref = np.concatenate([[task.theta0], x_ref[:-1, 0]])
+    else:
+        if has_theta_sequence:
+            reference_kind = str(ref_kind_input).lower() if ref_kind_input is not None else 'manual'
+            if reference_kind in ('ilqr', 'optimized', 'lqr'):
+                reference_kind = 'manual'
+            theta_seq = np.asarray(ref_opts['theta'], dtype=float)
+            if theta_seq.ndim != 1:
+                raise ValueError("Custom theta trajectory must be a 1-D array")
+            if len(theta_seq) == N + 1:
+                theta_profile = theta_seq.copy()
+            elif len(theta_seq) == N:
+                theta_profile = np.empty(N + 1, dtype=float)
+                theta_profile[0] = task.theta0
+                theta_profile[1:] = theta_seq
+            else:
+                raise ValueError(
+                    f"Custom theta trajectory length {len(theta_seq)} does not match expected {N} or {N+1} steps"
+                )
+        else:
+            reference_kind = ref_kind_lower
+            theta0 = float(ref_opts.get('theta0', task.theta0))
+            theta_goal = float(ref_opts.get('theta_goal', task.theta_goal))
+            if N == 0:
+                theta_profile = np.array([theta0], dtype=float)
+            elif ref_kind_lower == 'constant':
+                target = float(ref_opts.get('theta_goal', theta_goal))
+                theta_profile = np.full(N + 1, target, dtype=float)
+                theta_profile[0] = theta0
+            elif ref_kind_lower in ('piecewise_quad', 'pwq', 'pquad'):
+                tm_frac = float(ref_opts.get('tm_frac', 0.5))
+                tm_frac = min(max(tm_frac, 1e-3), 1.0 - 1e-3)
+                t_m = tm_frac * T
+                delta_T = max(T - t_m, 1e-12)
+                a = (theta_goal - theta0) / (t_m * (t_m + delta_T)) if T > 0 else 0.0
+                b = -(a * t_m) / delta_T if T > 0 else 0.0
+                theta_profile = np.empty_like(t_nodes)
+                for idx, tk in enumerate(t_nodes):
+                    if tk <= t_m:
+                        theta_profile[idx] = theta0 + a * tk * tk
+                    else:
+                        tau = tk - t_m
+                        theta_m = theta0 + a * t_m * t_m
+                        v_m = 2.0 * a * t_m
+                        theta_profile[idx] = theta_m + v_m * tau + b * tau * tau
+            else:
+                raise ValueError(f"Unknown reference kind '{ref_kind_input}'")
+        if theta_profile[0] != task.theta0:
+            theta_profile = theta_profile.copy()
+            theta_profile[0] = task.theta0
+        theta_ref = theta_profile
+
+    theta_ref = np.asarray(theta_ref, dtype=float)
     omega_ref = finite_diff(theta_ref, dt)
     alpha_ref = finite_diff(omega_ref, dt)
 
@@ -469,7 +549,7 @@ def rollout_once(
             theta=th_log[:k+1], omega=om_log[:k+1],
             u_rl=u_rl_log[:k+1], u_eq=u_eq_log[:k+1], u_s=u_s_log[:k+1], d_hat=d_hat_log[:k+1],
             u_tde=u_tde_log[:k+1], u_smc=u_smc_log[:k+1], u_total=u_total_log[:k+1],
-            disturbance=dist_log[:k+1]
+            disturbance=dist_log[:k+1], reference_kind=reference_kind
         )
     return metrics, logs
 
@@ -593,6 +673,7 @@ def evaluate_and_rollout(
     lqr_w: LQRWeights,
     smc_cfg: SMCConfig,
     cost_cfg: CostConfig,
+    reference: Optional[Dict[str, object]] = None,
     seed: int = 123
 ) -> Dict[str, np.ndarray]:
     """Simulate one rollout using a saved agent or pure TDE SMC.
@@ -600,6 +681,9 @@ def evaluate_and_rollout(
     If ``agent_name`` is ``'none'`` (case-insensitive) the rollout uses the
     TDE SMC controller without any residual RL action.  Otherwise the function
     loads the specified agent and includes its residual control.
+
+    ``reference`` is forwarded to :func:`rollout_once` to allow custom
+    trajectories for both the pure TDE+SMC and RL-augmented controllers.
 
     Returns a dictionary with arrays (each length ~ steps):
       - 't' : time [s]
@@ -627,7 +711,9 @@ def evaluate_and_rollout(
 
     task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     plant = OneDOFRotorPlant(plant_p)
-    metrics, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed, collect_logs=True)
+    metrics, logs = rollout_once(
+        plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, reference=reference, seed=seed, collect_logs=True
+    )
     logs['metrics'] = metrics
     return logs
 
@@ -644,13 +730,19 @@ def default_params():
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
 
-def plot_rollout_and_errors(agent_name: str, theta0: float, theta_goal: float) -> None:
+def plot_rollout_and_errors(
+    agent_name: str, theta0: float, theta_goal: float, reference: Optional[Dict[str, object]] = None
+) -> None:
     """Plot trajectories and errors for an agent or pure TDE SMC.
 
     If ``agent_name`` is ``'none'`` the function plots only the TDE SMC
     trajectory.  Otherwise it compares the agent-augmented controller against a
     pure TDE SMC baseline.  In both cases the initial and goal angles are
-    indicated and the total cost is printed.
+    indicated and the total cost is printed.  The optional ``reference``
+    argument is passed through to :func:`evaluate_and_rollout` so the same
+    custom trajectory can be reused for both controllers.  Run the helper twice
+    (with and without ``reference``) to compare a custom profile against the
+    optimized iLQR result.
     """
     import matplotlib.pyplot as plt
 
@@ -667,6 +759,7 @@ def plot_rollout_and_errors(agent_name: str, theta0: float, theta_goal: float) -
             lqr_w=lqr_w,
             smc_cfg=smc_cfg,
             cost_cfg=cost_cfg,
+            reference=reference,
         )
         print(f"TDE SMC total cost: {logs_smc['metrics']['total_cost']:.3f}")
 
@@ -715,13 +808,14 @@ def plot_rollout_and_errors(agent_name: str, theta0: float, theta_goal: float) -
         lqr_w=lqr_w,
         smc_cfg=smc_cfg,
         cost_cfg=cost_cfg,
+        reference=reference,
     )
     print(f"Agent total cost: {logs_agent['metrics']['total_cost']:.3f}")
 
     plant = OneDOFRotorPlant(plant_p)
     task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     metrics_smc, logs_smc = rollout_once(
-        plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, collect_logs=True
+        plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, reference=reference, collect_logs=True
     )
     print(f"TDE SMC total cost: {metrics_smc['total_cost']:.3f}")
 
@@ -773,41 +867,141 @@ def plot_rollout_and_errors(agent_name: str, theta0: float, theta_goal: float) -
 if __name__ == "__main__":
     # === Example usage ===
     plant_p, nom, lqr_w, smc_cfg, cost_cfg = default_params()
+    theta0 = 0.0
+    theta_goal = math.radians(60)
 
     # 1) Train and save a SIMPLE agent
     # train_and_save(agent_name="demo_simple", agent_type='simple',
     #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90)),
+    #               task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(90)),
     #               cost_cfg=cost_cfg, total_steps=30000)
 
     # 2) Train and save a SAC agent
     # train_and_save(agent_name="demo_sac", agent_type='sac',
     #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(90)),
+    #               task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(90)),
     #               cost_cfg=cost_cfg, total_steps=60000)
 
     # 3) Evaluate a saved agent and get all logs
-    # logs = evaluate_and_rollout(
-    #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60),
-    #     plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg, cost_cfg=cost_cfg)
-    # print("Keys in logs:", list(logs.keys()))
+    import matplotlib.pyplot as plt
+
+    agent_to_evaluate = "demo_sac"  # change to the agent you saved or set to 'none'
+    custom_reference = {"kind": "piecewise_quad", "tm_frac": 0.4}
+    comparison_setups = [
+        ("Piecewise quadratic", custom_reference),
+        ("Optimized iLQR", None),
+    ]
+
+    evaluation_cases = []
+    for label, reference in comparison_setups:
+        case = {"label": label, "reference": reference}
+        logs_smc = evaluate_and_rollout(
+            agent_name="none",
+            theta0=theta0,
+            theta_goal=theta_goal,
+            plant_p=plant_p,
+            nom=nom,
+            lqr_w=lqr_w,
+            smc_cfg=smc_cfg,
+            cost_cfg=cost_cfg,
+            reference=reference,
+        )
+        case["smc"] = logs_smc
+        print(f"[{label}] TDE SMC total cost: {logs_smc['metrics']['total_cost']:.3f}")
+        smc_mean_torque = float(np.mean(logs_smc['u_total']))
+        print(f"[{label}] Mean torque (TDE SMC): {smc_mean_torque:.4f} Nm")
+
+        if agent_to_evaluate and agent_to_evaluate.lower() != "none":
+            try:
+                logs_agent = evaluate_and_rollout(
+                    agent_name=agent_to_evaluate,
+                    theta0=theta0,
+                    theta_goal=theta_goal,
+                    plant_p=plant_p,
+                    nom=nom,
+                    lqr_w=lqr_w,
+                    smc_cfg=smc_cfg,
+                    cost_cfg=cost_cfg,
+                    reference=reference,
+                )
+            except FileNotFoundError as exc:
+                print(f"[{label}] Skipping agent '{agent_to_evaluate}': {exc}")
+                logs_agent = None
+                agent_to_evaluate = "none"
+            else:
+                case["agent"] = logs_agent
+                print(f"[{label}] RL+SMC total cost: {logs_agent['metrics']['total_cost']:.3f}")
+                agent_mean_torque = float(np.mean(logs_agent['u_total']))
+                print(f"[{label}] Mean torque (RL+SMC): {agent_mean_torque:.4f} Nm")
+
+        evaluation_cases.append(case)
+
+    for case in evaluation_cases:
+        label = case["label"]
+        reference = case["reference"]
+        logs_smc = case["smc"]
+        logs_agent = case.get("agent")
+
+        fig, axes = plt.subplots(4, 1, sharex=True, figsize=(9, 11))
+        ref_title = f"{label} reference"
+        if reference:
+            ref_title += f" ({reference})"
+        fig.suptitle(ref_title)
+
+        axes[0].plot(logs_smc['t'], logs_smc['theta_ref'], 'k--', linewidth=1.1, label='Reference θ')
+        axes[0].plot(logs_smc['t'], logs_smc['theta'], label='TDE+SMC θ')
+        if logs_agent is not None:
+            axes[0].plot(logs_agent['t'], logs_agent['theta'], label='RL+SMC θ')
+        axes[0].set_ylabel('θ [rad]')
+        axes[0].legend(loc='best')
+
+        axes[1].plot(
+            logs_smc['t'],
+            logs_smc['theta'] - logs_smc['theta_ref'],
+            label='TDE+SMC θ error',
+        )
+        if logs_agent is not None:
+            axes[1].plot(
+                logs_agent['t'],
+                logs_agent['theta'] - logs_agent['theta_ref'],
+                label='RL+SMC θ error',
+            )
+        axes[1].set_ylabel('θ error [rad]')
+        axes[1].legend(loc='best')
+
+        axes[2].plot(logs_smc['t'], logs_smc['u_smc'], label='TDE+SMC u_smc')
+        if np.any(np.abs(logs_smc['u_rl']) > 1e-9):
+            axes[2].plot(logs_smc['t'], logs_smc['u_rl'], label='TDE+SMC u_rl')
+        if logs_agent is not None:
+            axes[2].plot(logs_agent['t'], logs_agent['u_smc'], label='RL+SMC u_smc')
+            axes[2].plot(logs_agent['t'], logs_agent['u_rl'], label='RL residual')
+        axes[2].set_ylabel('Input effort [Nm]')
+        axes[2].legend(loc='best')
+
+        axes[3].plot(logs_smc['t'], logs_smc['u_total'], label='TDE+SMC torque')
+        if logs_agent is not None:
+            axes[3].plot(logs_agent['t'], logs_agent['u_total'], label='RL+SMC torque')
+        axes[3].set_ylabel('Torque [Nm]')
+        axes[3].set_xlabel('Time [s]')
+        axes[3].legend(loc='best')
+
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
 
     # 4) Plot agent rollout against pure TDE SMC and show errors
     # plot_rollout_and_errors(
-    #     agent_name="demo_sac", theta0=0.0, theta_goal=math.radians(60)
+    #     agent_name="demo_sac", theta0=theta0, theta_goal=theta_goal
     # )
 
     # 5) Plot only TDE SMC (no agent residual)
     # plot_rollout_and_errors(
-    #     agent_name="none", theta0=0.0, theta_goal=math.radians(60)
+    #     agent_name="none", theta0=theta0, theta_goal=theta_goal
     # )
 
     # 6) Run a rollout with pure TDE SMC and plot key signals
     plant = OneDOFRotorPlant(plant_p)
-    task = Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(60))
+    task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     _, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, seed=0, collect_logs=True)
-
-    import matplotlib.pyplot as plt
     t = logs['t']
 
     # plot theta and theta_ref
