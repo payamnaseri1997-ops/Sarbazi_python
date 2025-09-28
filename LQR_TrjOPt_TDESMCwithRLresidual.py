@@ -985,6 +985,15 @@ if __name__ == "__main__":
         axes[3].set_xlabel('Time [s]')
         axes[3].legend(loc='best')
 
+        plt.figure()
+        plt.plot(logs_smc['t'], logs_smc['omega_ref'], 'k--', linewidth=1.1, label='Reference ω')
+        plt.plot(logs_smc['t'], logs_smc['omega'], label='TDE+SMC ω')
+        if logs_agent is not None:
+            plt.plot(logs_agent['t'], logs_agent['omega'], label='RL+SMC ω')
+        plt.xlabel('Time [s]')
+        plt.ylabel('ω [rad/s]')
+        plt.legend(loc='best')
+
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
 
