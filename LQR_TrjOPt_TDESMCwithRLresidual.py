@@ -1062,3 +1062,129 @@ if __name__ == "__main__":
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
 
+    #%% 1) Train and save a SIMPLE agent
+    train_and_save(agent_name="demo_simple", agent_type='simple',
+                  plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
+                  task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(180)),
+                  cost_cfg=cost_cfg, total_steps=30000)
+
+    #%% 2) Train and save a SAC agent
+    train_and_save(agent_name="demo_sac", agent_type='sac',
+                  plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
+                  task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(180)),
+                  cost_cfg=cost_cfg, total_steps=60000)
+
+    #%% 3) Evaluate a saved agent and get all logs with ifferent reference trajectory
+
+    agent_to_evaluate = "demo_sac"  # change to the agent you saved or set to 'none'
+    custom_reference = {"kind": "piecewise_quad", "tm_frac": 0.4} # "kind": "piecewise_quad" or "constant"
+    comparison_setups = [
+        ("Constant reference", custom_reference), # "Piecewise quadratic" or "Constant reference"
+        ("Optimized iLQR", None),
+    ]
+
+    evaluation_cases = []
+    for label, reference in comparison_setups:
+        case = {"label": label, "reference": reference}
+        logs_smc = evaluate_and_rollout(
+            agent_name="none",
+            theta0=theta0,
+            theta_goal=theta_goal,
+            plant_p=plant_p,
+            nom=nom,
+            lqr_w=lqr_w,
+            smc_cfg=smc_cfg,
+            cost_cfg=cost_cfg,
+            reference=reference,
+        )
+        case["smc"] = logs_smc
+        print(f"[{label}] TDE SMC total cost: {logs_smc['metrics']['total_cost']:.3f}")
+        smc_mean_torque = float(np.mean(logs_smc['u_total']))
+        print(f"[{label}] Mean torque (TDE SMC): {smc_mean_torque:.4f} Nm")
+
+        if agent_to_evaluate and agent_to_evaluate.lower() != "none":
+            try:
+                logs_agent = evaluate_and_rollout(
+                    agent_name=agent_to_evaluate,
+                    theta0=theta0,
+                    theta_goal=theta_goal,
+                    plant_p=plant_p,
+                    nom=nom,
+                    lqr_w=lqr_w,
+                    smc_cfg=smc_cfg,
+                    cost_cfg=cost_cfg,
+                    reference=reference,
+                )
+            except FileNotFoundError as exc:
+                print(f"[{label}] Skipping agent '{agent_to_evaluate}': {exc}")
+                logs_agent = None
+                agent_to_evaluate = "none"
+            else:
+                case["agent"] = logs_agent
+                print(f"[{label}] RL+SMC total cost: {logs_agent['metrics']['total_cost']:.3f}")
+                agent_mean_torque = float(np.mean(logs_agent['u_total']))
+                print(f"[{label}] Mean torque (RL+SMC): {agent_mean_torque:.4f} Nm")
+
+        evaluation_cases.append(case)
+
+    for case in evaluation_cases:
+        label = case["label"]
+        reference = case["reference"]
+        logs_smc = case["smc"]
+        logs_agent = case.get("agent")
+
+        fig, axes = plt.subplots(4, 1, sharex=True, figsize=(9, 11))
+        ref_title = f"{label} reference"
+        if reference:
+            ref_title += f" ({reference})"
+        fig.suptitle(ref_title)
+
+        axes[0].plot(logs_smc['t'], logs_smc['theta_ref'], 'k--', linewidth=1.1, label='Reference θ')
+        axes[0].plot(logs_smc['t'], logs_smc['theta'], label='TDE+SMC θ')
+        if logs_agent is not None:
+            axes[0].plot(logs_agent['t'], logs_agent['theta'], label='RL+SMC θ')
+        axes[0].set_ylabel('θ [rad]')
+        axes[0].legend(loc='best')
+
+        axes[1].plot(
+            logs_smc['t'],
+            logs_smc['theta'] - logs_smc['theta_ref'],
+            label='TDE+SMC θ error',
+        )
+        if logs_agent is not None:
+            axes[1].plot(
+                logs_agent['t'],
+                logs_agent['theta'] - logs_agent['theta_ref'],
+                label='RL+SMC θ error',
+            )
+        axes[1].set_ylabel('θ error [rad]')
+        axes[1].legend(loc='best')
+
+        axes[2].plot(logs_smc['t'], logs_smc['u_smc'], label='TDE+SMC u_smc')
+        if np.any(np.abs(logs_smc['u_rl']) > 1e-9):
+            axes[2].plot(logs_smc['t'], logs_smc['u_rl'], label='TDE+SMC u_rl')
+        if logs_agent is not None:
+            axes[2].plot(logs_agent['t'], logs_agent['u_smc'], label='RL+SMC u_smc')
+            axes[2].plot(logs_agent['t'], logs_agent['u_rl'], label='RL residual')
+        axes[2].set_ylabel('Input effort [Nm]')
+        axes[2].legend(loc='best')
+
+        axes[3].plot(logs_smc['t'], logs_smc['u_total'], label='TDE+SMC torque')
+        if logs_agent is not None:
+            axes[3].plot(logs_agent['t'], logs_agent['u_total'], label='RL+SMC torque')
+        axes[3].set_ylabel('Torque [Nm]')
+        axes[3].set_xlabel('Time [s]')
+        axes[3].legend(loc='best')
+
+        plt.figure()
+        plt.plot(logs_smc['t'], logs_smc['omega_ref'], 'k--', linewidth=1.1, label='Reference ω')
+        plt.plot(logs_smc['t'], logs_smc['omega'], label='TDE+SMC ω')
+        if logs_agent is not None:
+            plt.plot(logs_agent['t'], logs_agent['omega'], label='RL+SMC ω')
+        plt.xlabel('Time [s]')
+        plt.ylabel('ω [rad/s]')
+        plt.legend(loc='best')
+
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
+
