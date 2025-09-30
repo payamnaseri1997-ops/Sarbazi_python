@@ -56,6 +56,7 @@ class PlantParams:
     tau_i : float
         Electrical/torque loop time constant [s].
     K_t : float
+
         Motor torque constant translating command units to [N·m].
     m1 : float, optional
         Grey base mass contributing to inertia [kg].
@@ -93,6 +94,11 @@ class PlantParams:
         Gravity magnitude used for tilt loading [m/s²].
     subtract_gravity_in_ueq : bool, optional
         Enable pre-cancellation of gravity inside ``u_eq`` when ``True``.
+=======
+        Torque constant (command-to-torque gain) [N·m / command unit].
+    Geometry parameters describe the distributed masses used to compute the
+    equivalent inertia ``J_eq`` and their positions for gravity loading when the
+    base is tilted by ``alpha`` (roll) and ``phi`` (pitch).
     """
 
     J: float
@@ -102,6 +108,7 @@ class PlantParams:
     dt: float
     tau_i: float
     K_t: float
+
     m1: float = 2.0     # [kg] Grey base mass (solid disk)
     R1: float = 0.10    # [m] Grey base radius
     m2: float = 0.5     # [kg] Blue post mass
@@ -120,6 +127,25 @@ class PlantParams:
     phi: float = math.radians(3.0)    # [rad] Platform pitch tilt
     g: float = 9.81                   # [m/s²] Gravity magnitude
     subtract_gravity_in_ueq: bool = False  # Gravity handled by TDE when False
+    m1: float = 0.0
+    R1: float = 0.0
+    m2: float = 0.0
+    a2: float = 0.0
+    r1: float = 0.0
+    m3: float = 0.0
+    a3: float = 0.0
+    r2: float = 0.0
+    m4: float = 0.0
+    L4: float = 0.0
+    l4_c: float = 0.0
+    gamma: float = 0.0
+    beta2: float = 0.0
+    beta4: float = 0.0
+    alpha: float = 0.0
+    phi: float = 0.0
+    g: float = 9.81
+    subtract_gravity_in_ueq: bool = False
+
 
 @dataclass
 class NominalModel:
@@ -1003,6 +1029,24 @@ def default_params():
         g=9.81,
         subtract_gravity_in_ueq=False,
     )
+    plant_p.m1 = 2.0
+    plant_p.R1 = 0.10
+    plant_p.m2 = 0.5
+    plant_p.a2 = 0.01
+    plant_p.r1 = 0.07
+    plant_p.beta2 = 0.0
+    plant_p.m3 = 0.8
+    plant_p.a3 = 0.015
+    plant_p.r2 = 0.08
+    plant_p.m4 = 0.4
+    plant_p.L4 = 0.20
+    plant_p.l4_c = 0.10
+    plant_p.gamma = 0.0
+    plant_p.beta4 = 0.0
+    plant_p.alpha = math.radians(5.0)
+    plant_p.phi = math.radians(3.0)
+    plant_p.g = 9.81
+    plant_p.subtract_gravity_in_ueq = False
     nom = NominalModel(J=0.05, b=0.06)
     lqr_w = LQRWeights(q_theta=85.0, q_omega=18.0, r_u=0.02, qT_theta=4200.0, qT_omega=220.0)
     smc_cfg = SMCConfig(lambda_s=35.0, k=0.85, phi=0.025)
