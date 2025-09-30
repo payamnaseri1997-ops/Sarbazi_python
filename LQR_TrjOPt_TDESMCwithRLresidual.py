@@ -57,6 +57,9 @@ class PlantParams:
         Time constant of the first-order current/torque loop [s].
     K_t : float
         Torque constant (command-to-torque gain) [N·m / command unit].
+    Geometry parameters describe the distributed masses used to compute the
+    equivalent inertia ``J_eq`` and their positions for gravity loading when the
+    base is tilted by ``alpha`` (roll) and ``phi`` (pitch).
     """
 
     J: float
@@ -66,12 +69,68 @@ class PlantParams:
     dt: float
     tau_i: float
     K_t: float
+    m1: float = 0.0
+    R1: float = 0.0
+    m2: float = 0.0
+    a2: float = 0.0
+    r1: float = 0.0
+    m3: float = 0.0
+    a3: float = 0.0
+    r2: float = 0.0
+    m4: float = 0.0
+    L4: float = 0.0
+    l4_c: float = 0.0
+    gamma: float = 0.0
+    beta2: float = 0.0
+    beta4: float = 0.0
+    alpha: float = 0.0
+    phi: float = 0.0
+    g: float = 9.81
+    subtract_gravity_in_ueq: bool = False
 
 @dataclass
 class NominalModel:
     """Nominal model parameters used in controller/trajectory computations."""
     J: float
     b: float
+
+
+def J_local_cylinder_z(m: float, a: float) -> float:
+    """Polar moment about the local cylinder axis (solid)."""
+    return 0.5 * m * a * a
+
+
+def J_bar_inplane_COM(m: float, L: float) -> float:
+    """Polar inertia of a slender bar in-plane about its COM."""
+    return (1.0 / 12.0) * m * L * L
+
+
+def red_link_radius_from_pin(r2: float, l_c: float, gamma: float) -> float:
+    """Horizontal distance from base axis to the red link COM."""
+    return math.sqrt(max(0.0, r2 * r2 + l_c * l_c + 2.0 * r2 * l_c * math.cos(gamma)))
+
+
+def compute_equivalent_inertia(p: PlantParams) -> float:
+    """Combine geometry contributions into the rotor equivalent inertia."""
+    J1 = 0.5 * p.m1 * p.R1 * p.R1 if p.m1 > 0 and p.R1 > 0 else 0.0
+    J2_local = J_local_cylinder_z(p.m2, p.a2) if p.m2 > 0 else 0.0
+    J3_local = J_local_cylinder_z(p.m3, p.a3) if p.m3 > 0 else 0.0
+    R4 = red_link_radius_from_pin(p.r2, p.l4_c, p.gamma) if p.m4 > 0 else 0.0
+    J4_com = J_bar_inplane_COM(p.m4, p.L4) if p.m4 > 0 else 0.0
+    J2 = J2_local + p.m2 * p.r1 * p.r1
+    J3 = J3_local + p.m3 * p.r2 * p.r2
+    J4 = J4_com + p.m4 * R4 * R4
+    return J1 + J2 + J3 + J4
+
+
+def gravity_proj_inplane(alpha: float, phi: float, g: float) -> Tuple[float, float]:
+    """Project gravity into the rotor plane given base tilt angles."""
+    gx = -g * math.sin(phi)
+    gy = g * math.sin(alpha) * math.cos(phi)
+    psi = math.atan2(gy, gx)
+    g_t = math.hypot(gx, gy)
+    return g_t, psi
+
 
 class OneDOFRotorPlant:
     """True 1-DoF rotational system with a first-order torque servo.
@@ -97,6 +156,7 @@ class OneDOFRotorPlant:
     def __init__(self, p: PlantParams):
         self.p = p
         self.state = np.zeros(3)  # [theta, omega, tau_m]
+        self.J_eq = compute_equivalent_inertia(self.p)
         # Disturbance parameters (tune as needed)
         self.torque_coulomb = 0.02  # Nm
         self.load_amp = 0.03        # Nm
@@ -113,6 +173,26 @@ class OneDOFRotorPlant:
         self.last_disturbance = 0.0
         self.last_tau_m = 0.0
         self.last_command = 0.0
+        self.last_gravity = 0.0
+
+    def gravity_torque(self, theta: float) -> float:
+        g_t, psi = gravity_proj_inplane(self.p.alpha, self.p.phi, self.p.g)
+        R4 = (
+            red_link_radius_from_pin(self.p.r2, self.p.l4_c, self.p.gamma)
+            if self.p.m4 > 0
+            else 0.0
+        )
+        tau2 = (
+            self.p.m2 * self.p.r1 * g_t * math.sin(theta + self.p.beta2 - psi)
+            if self.p.m2 > 0
+            else 0.0
+        )
+        tau4 = (
+            self.p.m4 * R4 * g_t * math.sin(theta + self.p.beta4 - psi)
+            if self.p.m4 > 0
+            else 0.0
+        )
+        return tau2 + tau4
 
     def reset(
         self,
@@ -127,10 +207,12 @@ class OneDOFRotorPlant:
         Returns the current state copy.
         """
         self.state[:] = [theta0, omega0, tau_m0]
+        self.J_eq = compute_equivalent_inertia(self.p)
         self.time = 0.0
         self.last_disturbance = 0.0
         self.last_tau_m = tau_m0
         self.last_command = 0.0
+        self.last_gravity = 0.0
         return self.state.copy()
 
     def step(self, u_cmd: float) -> np.ndarray:
@@ -155,13 +237,15 @@ class OneDOFRotorPlant:
         )
         d_var = amp_var * math.sin(2.0 * math.pi * freq_var * self.time)
         d_noise = np.random.randn() * self.noise_std
-        d = d_coul + d_per + d_var + d_noise
+        tau_g = self.gravity_torque(theta)
+        d = d_coul + d_per + d_var + d_noise + tau_g
         self.last_disturbance = d
         self.last_tau_m = tau_m
         self.last_command = u
+        self.last_gravity = tau_g
 
         # Dynamics integration (semi-implicit Euler)
-        domega = (tau_m - self.p.b * omega + d) / self.p.J
+        domega = (tau_m - self.p.b * omega + d) / self.J_eq
         omega_next = omega + domega * self.p.dt
         theta_next = theta + omega_next * self.p.dt
         tau_m_next = tau_m + self.p.dt * (
@@ -283,6 +367,7 @@ class TDE_SMC_Discrete:
         self.tau_m_hat: float = 0.0
         self.omega_hist: List[float] = []
         self.tau_m_hat_hist: List[float] = []
+        self.subtract_gravity_in_ueq: bool = False
 
     def reset(self):
         self.tau_m_hat = 0.0
@@ -298,6 +383,7 @@ class TDE_SMC_Discrete:
         omega_ref_k: float,
         omega_ref_k1: float,
         u_rl: float = 0.0,
+        plant: Optional[OneDOFRotorPlant] = None,
     ) -> Tuple[float, Dict[str, float]]:
         e = theta - theta_ref_k
         edot = omega - omega_ref_k
@@ -319,6 +405,8 @@ class TDE_SMC_Discrete:
         u_eq = self.hatb * omega + (self.hatJ / denom) * (
             domega_ref - self.cfg.lambda_s * (self.dt * omega - dtheta_ref)
         )
+        if getattr(self, "subtract_gravity_in_ueq", False) and plant is not None:
+            u_eq = u_eq - plant.gravity_torque(theta)
 
         s_norm = s / (self.cfg.phi + 1e-9)
         u_s = -self.cfg.k * np.tanh(s_norm)
@@ -432,7 +520,7 @@ def rollout_once(
       logs (if collect_logs=True): dict of arrays with keys:
         't', 'theta_ref', 'omega_ref', 'alpha_ref', 'theta', 'omega', 'tau_m',
         'u_rl', 'u_eq', 'u_s', 's', 'eta_hat', 'd_hat', 'u_tde', 'u_smc',
-        'u_total', 'disturbance', 'reference_kind'
+        'u_total', 'disturbance', 'gravity', 'reference_kind'
     """
     np.random.seed(seed)
     dt = plant.p.dt
@@ -527,6 +615,7 @@ def rollout_once(
         K_t=plant.p.K_t,
         smc=smc_cfg,
     )
+    smc.subtract_gravity_in_ueq = plant.p.subtract_gravity_in_ueq
     smc.reset()
     plant.reset(theta0=task.theta0, omega0=task.omega0)
 
@@ -549,6 +638,7 @@ def rollout_once(
         u_smc_log = np.zeros(N)
         u_total_log = np.zeros(N)
         dist_log = np.zeros(N)
+        gravity_log = np.zeros(N)
 
     total_cost = 0.0
     done = False
@@ -590,6 +680,7 @@ def rollout_once(
             omega_ref_k,
             omega_ref_k1,
             u_rl,
+            plant=plant,
         )
         plant.step(u_cmd)
 
@@ -642,6 +733,7 @@ def rollout_once(
             u_smc_log[k] = info['u_smc']
             u_total_log[k] = info['u_total']
             dist_log[k] = plant.last_disturbance
+            gravity_log[k] = plant.last_gravity
 
         steps_taken = k + 1
         if done:
@@ -673,6 +765,7 @@ def rollout_once(
             u_smc=u_smc_log[:steps],
             u_total=u_total_log[:steps],
             disturbance=dist_log[:steps],
+            gravity=gravity_log[:steps],
             reference_kind=reference_kind,
         )
     return metrics, logs
@@ -815,7 +908,7 @@ def evaluate_and_rollout(
       - 'theta', 'omega', 'tau_m'       (actual plant)
       - 'u_eq', 'u_s', 's', 'eta_hat', 'd_hat', 'u_tde', 'u_smc'
       - 'u_rl'                          (RL residual)
-      - 'u_total', 'disturbance'        (command & total disturbance)
+      - 'u_total', 'disturbance', 'gravity'        (command, total disturbance, gravity torque)
     """
     agent: Optional[ResidualAgentAPI] = None
     if agent_name is not None and agent_name.lower() != 'none':
@@ -855,6 +948,24 @@ def default_params():
         tau_i=0.01,
         K_t=1.0,
     )
+    plant_p.m1 = 2.0
+    plant_p.R1 = 0.10
+    plant_p.m2 = 0.5
+    plant_p.a2 = 0.01
+    plant_p.r1 = 0.07
+    plant_p.beta2 = 0.0
+    plant_p.m3 = 0.8
+    plant_p.a3 = 0.015
+    plant_p.r2 = 0.08
+    plant_p.m4 = 0.4
+    plant_p.L4 = 0.20
+    plant_p.l4_c = 0.10
+    plant_p.gamma = 0.0
+    plant_p.beta4 = 0.0
+    plant_p.alpha = math.radians(5.0)
+    plant_p.phi = math.radians(3.0)
+    plant_p.g = 9.81
+    plant_p.subtract_gravity_in_ueq = False
     nom = NominalModel(J=0.05, b=0.06)
     lqr_w = LQRWeights(q_theta=80.0, q_omega=15.0, r_u=0.02, qT_theta=4000.0, qT_omega=200.0)
     smc_cfg = SMCConfig(lambda_s=40.0, k=0.8, phi=0.03)
