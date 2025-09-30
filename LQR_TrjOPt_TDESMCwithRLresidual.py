@@ -44,18 +44,57 @@ class PlantParams:
     Parameters
     ----------
     J : float
-        Rotor inertia [kg·m²].
+        Rotor inertia used by legacy energy calculations [kg·m²].
     b : float
-        Viscous damping [N·m·s/rad].
+        Equivalent viscous damping coefficient [N·m·s/rad].
     u_max : float
-        Servo command magnitude limit (torque reference) [N·m].
+        Maximum commanded torque magnitude at the actuator [N·m].
     omega_max : float
-        Soft speed limit used in cost function [rad/s].
+        Soft angular-speed limit employed in the cost function [rad/s].
     dt : float
-        Control / integration time step [s].
+        Control and integration sampling period [s].
     tau_i : float
-        Time constant of the first-order current/torque loop [s].
+        Electrical/torque loop time constant [s].
     K_t : float
+
+        Motor torque constant translating command units to [N·m].
+    m1 : float, optional
+        Grey base mass contributing to inertia [kg].
+    R1 : float, optional
+        Grey base radius measured from the spin axis [m].
+    m2 : float, optional
+        Blue post mass located at offset ``r1`` [kg].
+    a2 : float, optional
+        Blue post local radius used for its own polar inertia [m].
+    r1 : float, optional
+        Blue post radial offset from the spin axis [m].
+    m3 : float, optional
+        Orange post mass located at offset ``r2`` [kg].
+    a3 : float, optional
+        Orange post local radius [m].
+    r2 : float, optional
+        Orange post radial offset from the spin axis [m].
+    m4 : float, optional
+        Red link mass treated as a slender bar [kg].
+    L4 : float, optional
+        Red link total length for the in-plane inertia calculation [m].
+    l4_c : float, optional
+        Red link centre-of-mass distance from the joint along the link [m].
+    gamma : float, optional
+        Red link COM azimuth in the plane relative to the orange post [rad].
+    beta2 : float, optional
+        In-plane azimuth of the blue post COM relative to the spin axis [rad].
+    beta4 : float, optional
+        In-plane azimuth of the red link COM relative to the spin axis [rad].
+    alpha : float, optional
+        Platform roll tilt angle (rotation about x) [rad].
+    phi : float, optional
+        Platform pitch tilt angle (rotation about y) [rad].
+    g : float, optional
+        Gravity magnitude used for tilt loading [m/s²].
+    subtract_gravity_in_ueq : bool, optional
+        Enable pre-cancellation of gravity inside ``u_eq`` when ``True``.
+=======
         Torque constant (command-to-torque gain) [N·m / command unit].
     Geometry parameters describe the distributed masses used to compute the
     equivalent inertia ``J_eq`` and their positions for gravity loading when the
@@ -69,6 +108,25 @@ class PlantParams:
     dt: float
     tau_i: float
     K_t: float
+
+    m1: float = 2.0     # [kg] Grey base mass (solid disk)
+    R1: float = 0.10    # [m] Grey base radius
+    m2: float = 0.5     # [kg] Blue post mass
+    a2: float = 0.01    # [m] Blue post local radius
+    r1: float = 0.07    # [m] Blue post radial offset from spin axis
+    m3: float = 0.8     # [kg] Orange post mass
+    a3: float = 0.015   # [m] Orange post local radius
+    r2: float = 0.08    # [m] Orange post radial offset from spin axis
+    m4: float = 0.4     # [kg] Red link mass (slender bar)
+    L4: float = 0.20    # [m] Red link length
+    l4_c: float = 0.10  # [m] Red link COM distance from hinge along the link
+    gamma: float = 0.0  # [rad] Red link COM azimuth w.r.t orange post
+    beta2: float = 0.0  # [rad] Blue post COM azimuth about spin axis
+    beta4: float = 0.0  # [rad] Red link COM azimuth about spin axis
+    alpha: float = math.radians(5.0)  # [rad] Platform roll tilt
+    phi: float = math.radians(3.0)    # [rad] Platform pitch tilt
+    g: float = 9.81                   # [m/s²] Gravity magnitude
+    subtract_gravity_in_ueq: bool = False  # Gravity handled by TDE when False
     m1: float = 0.0
     R1: float = 0.0
     m2: float = 0.0
@@ -87,6 +145,7 @@ class PlantParams:
     phi: float = 0.0
     g: float = 9.81
     subtract_gravity_in_ueq: bool = False
+
 
 @dataclass
 class NominalModel:
@@ -336,9 +395,13 @@ def generate_reference_ilqr_like(
 @dataclass
 class SMCConfig:
     """Sliding Mode Controller (SMC) + TDE tuning parameters.
-    lambda_s: surface slope (>0). Higher = faster convergence but more control effort.
-    k: sliding gain (>0). Higher = stronger attraction to surface; too high may chatter.
-    phi: boundary layer half-width for smooth sat (tanh). Larger = smoother, more steady-state error.
+
+    lambda_s : float
+        Sliding surface slope [1/s]; larger values accelerate convergence.
+    k : float
+        Saturation gain [N·m]; increases robustness but may add chatter.
+    phi : float
+        Boundary-layer half width for the smooth saturation function [rad/s].
     """
     lambda_s: float = 30.0
     k: float = 0.6
@@ -947,6 +1010,24 @@ def default_params():
         dt=0.002,
         tau_i=0.01,
         K_t=1.0,
+        m1=2.0,
+        R1=0.10,
+        m2=0.5,
+        a2=0.01,
+        r1=0.07,
+        m3=0.8,
+        a3=0.015,
+        r2=0.08,
+        m4=0.4,
+        L4=0.20,
+        l4_c=0.10,
+        gamma=0.0,
+        beta2=0.0,
+        beta4=0.0,
+        alpha=math.radians(5.0),
+        phi=math.radians(3.0),
+        g=9.81,
+        subtract_gravity_in_ueq=False,
     )
     plant_p.m1 = 2.0
     plant_p.R1 = 0.10
@@ -967,8 +1048,8 @@ def default_params():
     plant_p.g = 9.81
     plant_p.subtract_gravity_in_ueq = False
     nom = NominalModel(J=0.05, b=0.06)
-    lqr_w = LQRWeights(q_theta=80.0, q_omega=15.0, r_u=0.02, qT_theta=4000.0, qT_omega=200.0)
-    smc_cfg = SMCConfig(lambda_s=40.0, k=0.8, phi=0.03)
+    lqr_w = LQRWeights(q_theta=85.0, q_omega=18.0, r_u=0.02, qT_theta=4200.0, qT_omega=220.0)
+    smc_cfg = SMCConfig(lambda_s=35.0, k=0.85, phi=0.025)
     cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
