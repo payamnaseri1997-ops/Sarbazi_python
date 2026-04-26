@@ -723,7 +723,7 @@ def rollout_once(
             cost_cfg.w_e * e * e
             + cost_cfg.w_edot * edot * edot
             + cost_cfg.w_omega * omega * omega
-            + cost_cfg.w_u * info['u_total'] * info['u_total']
+            + cost_cfg.w_u * u_rl * u_rl
         )
         r = -stage * dt
         total_cost += stage * dt
