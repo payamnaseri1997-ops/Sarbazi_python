@@ -139,6 +139,9 @@ class SACResidualPolicy(ResidualAgentAPI):
         return phi
 
     def act(self, obs_dict, eval: bool=False) -> float:
+        if (not eval) and (self.total_steps < self.cfg.start_steps):
+            return float(np.random.uniform(-self.cfg.u_rl_max, self.cfg.u_rl_max))
+
         o = torch.as_tensor(self._encode_obs(obs_dict), dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             if eval:
@@ -158,43 +161,44 @@ class SACResidualPolicy(ResidualAgentAPI):
     def update(self):
         if self.replay.len < self.cfg.batch_size:
             return
-        batch = self.replay.sample_batch(self.cfg.batch_size)
-        obs = batch['obs']; act = batch['act']; rew = batch['rew']; obs2 = batch['obs2']; done = batch['done']
-        alpha = self.log_alpha.exp()
+        for _ in range(self.cfg.updates_per_step):
+            batch = self.replay.sample_batch(self.cfg.batch_size)
+            obs = batch['obs']; act = batch['act']; rew = batch['rew']; obs2 = batch['obs2']; done = batch['done']
+            alpha = self.log_alpha.exp()
 
-        # Critic update
-        with torch.no_grad():
-            a2, logp2, _ = self.actor(obs2)
-            q1_t = self.q1_t(obs2, a2)
-            q2_t = self.q2_t(obs2, a2)
-            q_t = torch.min(q1_t, q2_t) - alpha * logp2
-            backup = rew + self.cfg.gamma * (1 - done) * q_t
-        q1 = self.q1(obs, act)
-        q2 = self.q2(obs, act)
-        q1_loss = ((q1 - backup)**2).mean()
-        q2_loss = ((q2 - backup)**2).mean()
-        self.q1_optim.zero_grad(); q1_loss.backward(); self.q1_optim.step()
-        self.q2_optim.zero_grad(); q2_loss.backward(); self.q2_optim.step()
+            # Critic update
+            with torch.no_grad():
+                a2, logp2, _ = self.actor(obs2)
+                q1_t = self.q1_t(obs2, a2)
+                q2_t = self.q2_t(obs2, a2)
+                q_t = torch.min(q1_t, q2_t) - alpha * logp2
+                backup = rew + self.cfg.gamma * (1 - done) * q_t
+            q1 = self.q1(obs, act)
+            q2 = self.q2(obs, act)
+            q1_loss = ((q1 - backup)**2).mean()
+            q2_loss = ((q2 - backup)**2).mean()
+            self.q1_optim.zero_grad(); q1_loss.backward(); self.q1_optim.step()
+            self.q2_optim.zero_grad(); q2_loss.backward(); self.q2_optim.step()
 
-        # Actor update
-        a, logp, _ = self.actor(obs)
-        q1_pi = self.q1(obs, a)
-        q2_pi = self.q2(obs, a)
-        q_pi = torch.min(q1_pi, q2_pi)
-        pi_loss = (alpha * logp - q_pi).mean()
-        self.pi_optim.zero_grad(); pi_loss.backward(); self.pi_optim.step()
+            # Actor update
+            a, logp, _ = self.actor(obs)
+            q1_pi = self.q1(obs, a)
+            q2_pi = self.q2(obs, a)
+            q_pi = torch.min(q1_pi, q2_pi)
+            pi_loss = (alpha.detach() * logp - q_pi).mean()
+            self.pi_optim.zero_grad(); pi_loss.backward(); self.pi_optim.step()
 
-        # Temperature (alpha) update
-        if self.alpha_optim is not None:
-            alpha_loss = (-self.log_alpha * (logp + self.target_entropy).detach()).mean()
-            self.alpha_optim.zero_grad(); alpha_loss.backward(); self.alpha_optim.step()
+            # Temperature (alpha) update
+            if self.alpha_optim is not None:
+                alpha_loss = (-self.log_alpha * (logp + self.target_entropy).detach()).mean()
+                self.alpha_optim.zero_grad(); alpha_loss.backward(); self.alpha_optim.step()
 
-        # Soft target updates
-        with torch.no_grad():
-            for p, p_t in zip(self.q1.parameters(), self.q1_t.parameters()):
-                p_t.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
-            for p, p_t in zip(self.q2.parameters(), self.q2_t.parameters()):
-                p_t.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
+            # Soft target updates
+            with torch.no_grad():
+                for p, p_t in zip(self.q1.parameters(), self.q1_t.parameters()):
+                    p_t.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
+                for p, p_t in zip(self.q2.parameters(), self.q2_t.parameters()):
+                    p_t.data.mul_(1 - self.cfg.tau).add_(self.cfg.tau * p.data)
 
     def end_episode(self):
         pass

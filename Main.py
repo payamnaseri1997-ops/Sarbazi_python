@@ -261,7 +261,7 @@ class CostConfig:
     """Weights for the per-step cost used as negative reward in RL."""
     w_e: float = 5.0        # angle error weight
     w_edot: float = 0.5     # velocity error weight
-    w_u: float = 0.02       # total control effort weight (includes RL residual)
+    w_u: float = 0.02       # residual control effort weight (RL action only)
     w_omega: float = 0.2    # absolute speed penalty
     goal_tol: float = 1e-2  # termination tolerance for |θ-θ_goal| and |ω|
     done_bonus: float = 3.0 # extra reward when finished early
@@ -309,6 +309,7 @@ def rollout_once(
     cost_cfg: CostConfig,
     seed: int = 0,
     collect_logs: bool = False,
+    training: bool = True,
 ):
     """Run one episode. If agent is None, runs SMC without residual.
 
@@ -353,7 +354,7 @@ def rollout_once(
     done = False
     t = 0.0
 
-    if agent is not None:
+    if agent is not None and training:
         agent.begin_episode()
 
     for k in range(N):
@@ -369,7 +370,10 @@ def rollout_once(
         o = np.array([obs['e'], obs['edot'], obs['s'], obs['omega'], 1.0, obs['time_frac']], dtype=np.float32)
         o = np.clip(o, -5.0, 5.0)
 
-        u_rl = 0.0 if agent is None else agent.act(obs, eval=False)
+        if agent is None:
+            u_rl = 0.0
+        else:
+            u_rl = agent.act(obs, eval=not training)
         u_cmd, info = smc.control(theta, omega, theta_ref[k], omega_ref[k], alpha_ref[k], u_rl)
         plant.step(u_cmd)
 
@@ -397,8 +401,9 @@ def rollout_once(
         # terminal condition
         if (abs(theta2 - task.theta_goal) < cost_cfg.goal_tol) and (abs(omega2) < cost_cfg.goal_tol):
             done = True
+            r += cost_cfg.done_bonus
 
-        if agent is not None:
+        if agent is not None and training:
             agent.observe(o, np.array([u_rl], dtype=np.float32), r, o2, float(done))
             agent.update()
 
@@ -420,7 +425,7 @@ def rollout_once(
             break
         t += dt
 
-    if agent is not None:
+    if agent is not None and training:
         agent.end_episode()
 
     metrics = dict(total_cost=total_cost, finished=1.0 if done else 0.0, time=t)
@@ -443,7 +448,6 @@ META_EXT = ".meta.json"
 
 # Import RL agents (files below in this canvas)
 from rl_simple import SimpleResidualPolicy, RLConfig as SimpleRLConfig
-from rl_sac import SACResidualPolicy, SACConfig
 
 
 def save_meta(name: str, meta: Dict):
@@ -465,10 +469,38 @@ def make_agent(agent_type: str, u_rl_max: float) -> ResidualAgentAPI:
         cfg = SimpleRLConfig(u_rl_max=u_rl_max)
         return SimpleResidualPolicy(n_features=6, cfg=cfg)
     elif agent_type == 'sac':
+        from rl_sac import SACResidualPolicy, SACConfig
         cfg = SACConfig(u_rl_max=u_rl_max)
         return SACResidualPolicy(obs_dim=6, act_dim=1, cfg=cfg)
     else:
         raise ValueError("agent_type must be 'simple' or 'sac'")
+
+def evaluate_fixed_case(
+    agent,
+    plant_p,
+    nom,
+    lqr_w,
+    smc_cfg,
+    cost_cfg,
+    theta_goal,
+    seed=999,
+):
+    task_eval = Task(theta0=0.0, omega0=0.0, theta_goal=theta_goal, horizon_s=1.2)
+    plant = OneDOFRotorPlant(plant_p)
+    metrics, logs = rollout_once(
+        plant,
+        nom,
+        task_eval,
+        lqr_w,
+        smc_cfg,
+        agent,
+        cost_cfg,
+        seed=seed,
+        collect_logs=True,
+        training=False,
+    )
+    return metrics, logs
+
 
 # -------------------------
 # Training & saving
@@ -503,7 +535,7 @@ def train_and_save(
         n_episodes = max(1, total_steps // steps_per_ep)
         print(f"Training SIMPLE residual RL for {n_episodes} episodes...")
         for ep in range(1, n_episodes + 1):
-            _, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=ep, collect_logs=False)
+            _, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=ep, collect_logs=False, training=True)
             if ep % 10 == 0:
                 print(f"Ep {ep}")
         # Save model and meta
@@ -519,10 +551,37 @@ def train_and_save(
         ep = 0
         while getattr(agent, 'replay').len < total_steps:
             ep += 1
-            metrics, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False)
+            metrics, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False, training=True)
             if ep % 5 == 0:
                 buf_len = getattr(agent, 'replay').len
-                print(f"Ep {ep:03d}: cost={metrics['total_cost']:.4f}, finished={int(metrics['finished'])}, buffer={buf_len}")
+                eval_smc, _ = evaluate_fixed_case(
+                    agent=None,
+                    plant_p=plant_p,
+                    nom=nom,
+                    lqr_w=lqr_w,
+                    smc_cfg=smc_cfg,
+                    cost_cfg=cost_cfg,
+                    theta_goal=task.theta_goal,
+                    seed=999,
+                )
+                eval_rl, _ = evaluate_fixed_case(
+                    agent=agent,
+                    plant_p=plant_p,
+                    nom=nom,
+                    lqr_w=lqr_w,
+                    smc_cfg=smc_cfg,
+                    cost_cfg=cost_cfg,
+                    theta_goal=task.theta_goal,
+                    seed=999,
+                )
+                print(
+                    f"Ep {ep:03d}: "
+                    f"train_cost={metrics['total_cost']:.4f}, "
+                    f"eval_smc={eval_smc['total_cost']:.4f}, "
+                    f"eval_rl={eval_rl['total_cost']:.4f}, "
+                    f"finished_rl={int(eval_rl['finished'])}, "
+                    f"buffer={buf_len}"
+                )
         agent.save(agent_name, out_dir=AGENTS_DIR)
         save_meta(agent_name, {"type": "sac", "u_rl_max": agent.cfg.u_rl_max})
         print(f"Saved SAC agent as '{agent_name}' in ./{AGENTS_DIR}")
@@ -570,7 +629,7 @@ def evaluate_and_rollout(
 
     task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal, horizon_s=horizon_s)
     plant = OneDOFRotorPlant(plant_p)
-    metrics, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed, collect_logs=True)
+    metrics, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed, collect_logs=True, training=False)
     logs['metrics'] = metrics
     return logs
 
