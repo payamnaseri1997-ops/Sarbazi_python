@@ -94,14 +94,15 @@ class ReplayBuffer:
 
 @dataclass
 class SACConfig:
-    u_rl_max: float = 0.18     # residual torque bound
-    gamma: float = 0.997       # discount
-    tau: float = 0.005         # target smoothing
-    lr: float = 3e-4           # learning rate
-    batch_size: int = 256      # update batch size
-    start_steps: int = 2000    # random steps before using policy
-    updates_per_step: int = 1  # gradient steps per env step
-    alpha: float = 0.2         # initial temperature
+    u_rl_max: float = 0.35
+    gamma: float = 0.99
+    tau: float = 0.005
+    lr: float = 1e-3
+    batch_size: int = 100
+    start_steps: int = 3000
+    update_after: int = 1000
+    updates_per_step: int = 1
+    alpha: float = 0.05
     autotune_alpha: bool = True
 
 class SACResidualPolicy(ResidualAgentAPI):
@@ -159,7 +160,7 @@ class SACResidualPolicy(ResidualAgentAPI):
         self.total_steps += 1
 
     def update(self):
-        if self.replay.len < self.cfg.batch_size:
+        if self.replay.len < max(self.cfg.batch_size, self.cfg.update_after):
             return
         for _ in range(self.cfg.updates_per_step):
             batch = self.replay.sample_batch(self.cfg.batch_size)
@@ -210,7 +211,7 @@ class SACResidualPolicy(ResidualAgentAPI):
         torch.save(self.q1.state_dict(),    os.path.join(out_dir, f"{name}_sac_q1.pth"))
         torch.save(self.q2.state_dict(),    os.path.join(out_dir, f"{name}_sac_q2.pth"))
         meta = dict(cfg={k: float(getattr(self.cfg, k)) if isinstance(getattr(self.cfg, k), float) else getattr(self.cfg, k)
-                          for k in ['u_rl_max','gamma','tau','lr','batch_size','start_steps','updates_per_step','alpha','autotune_alpha']})
+                          for k in ['u_rl_max','gamma','tau','lr','batch_size','start_steps','update_after','updates_per_step','alpha','autotune_alpha']})
         with open(os.path.join(out_dir, f"{name}_sac_meta.json"), 'w') as f:
             json.dump(meta, f, indent=2)
 

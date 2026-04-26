@@ -11,6 +11,7 @@ from typing import Tuple, Dict, List, Optional
 import os, json, math
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
+import matplotlib.pyplot as plt
 
 # -------------------------
 # Utilities
@@ -259,12 +260,14 @@ class TDE_SMC_Controller:
 @dataclass
 class CostConfig:
     """Weights for the per-step cost used as negative reward in RL."""
-    w_e: float = 5.0        # angle error weight
-    w_edot: float = 0.5     # velocity error weight
-    w_u: float = 0.02       # residual control effort weight (RL action only)
-    w_omega: float = 0.2    # absolute speed penalty
-    goal_tol: float = 1e-2  # termination tolerance for |θ-θ_goal| and |ω|
-    done_bonus: float = 3.0 # extra reward when finished early
+    w_e: float = 20.0
+    w_edot: float = 2.0
+    w_u: float = 0.001
+    w_omega: float = 0.0
+    w_terminal: float = 50.0
+    w_terminal_omega: float = 2.0
+    goal_tol: float = 2e-2
+    done_bonus: float = 5.0
 
 @dataclass
 class Task:
@@ -381,7 +384,6 @@ def rollout_once(
         e = info['e']; edot = info['edot']
         stage = (cost_cfg.w_e * e * e
                  + cost_cfg.w_edot * edot * edot
-                 + cost_cfg.w_omega * omega * omega
                  + cost_cfg.w_u * u_rl * u_rl)
         r = -stage * dt
         total_cost += stage * dt
@@ -403,8 +405,18 @@ def rollout_once(
             done = True
             r += cost_cfg.done_bonus
 
+        at_last_step = (k == N - 1)
+        if at_last_step and (not done):
+            terminal_cost = (
+                cost_cfg.w_terminal * (theta2 - task.theta_goal) ** 2
+                + cost_cfg.w_terminal_omega * omega2 ** 2
+            )
+            r -= terminal_cost
+            total_cost += terminal_cost
+
         if agent is not None and training:
-            agent.observe(o, np.array([u_rl], dtype=np.float32), r, o2, float(done))
+            done_for_buffer = float(done or at_last_step)
+            agent.observe(o, np.array([u_rl], dtype=np.float32), r, o2, done_for_buffer)
             agent.update()
 
         if collect_logs:
@@ -502,6 +514,150 @@ def evaluate_fixed_case(
     return metrics, logs
 
 
+def print_rollout_diagnostics(logs, plant_p):
+    u_total = np.asarray(logs["u_total"])
+    u_rl = np.asarray(logs["u_rl"])
+    theta = np.asarray(logs["theta"])
+    theta_ref = np.asarray(logs["theta_ref"])
+    omega = np.asarray(logs["omega"])
+    omega_ref = np.asarray(logs["omega_ref"])
+    sat_frac = np.mean(np.abs(u_total) >= plant_p.u_max - 1e-9)
+    print(f"saturation fraction: {100 * sat_frac:.1f}%")
+    print(f"mean |u_rl|: {np.mean(np.abs(u_rl)):.5f}")
+    print(f"max |u_rl|: {np.max(np.abs(u_rl)):.5f}")
+    print(f"mean |theta error|: {np.mean(np.abs(theta - theta_ref)):.5f}")
+    print(f"mean |omega error|: {np.mean(np.abs(omega - omega_ref)):.5f}")
+
+
+def plot_control_rollout(logs, plant_p=None, title="Control rollout", save_dir=None, show=True):
+    t = np.asarray(logs["t"])
+    theta = np.asarray(logs["theta"])
+    theta_ref = np.asarray(logs["theta_ref"])
+    omega = np.asarray(logs["omega"])
+    omega_ref = np.asarray(logs["omega_ref"])
+    u_rl = np.asarray(logs["u_rl"])
+    u_smc = np.asarray(logs["u_smc"])
+    u_total = np.asarray(logs["u_total"])
+
+    fig, axs = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    axs[0].plot(t, u_rl, label="u_rl")
+    axs[0].plot(t, u_smc, label="u_smc")
+    axs[0].plot(t, u_total, label="u_total", linewidth=2)
+    if plant_p is not None:
+        axs[0].axhline(plant_p.u_max, color="k", linestyle="--", label="+u_max")
+        axs[0].axhline(-plant_p.u_max, color="k", linestyle="--", label="-u_max")
+    axs[0].set_ylabel("Torque")
+    axs[0].grid(True)
+    axs[0].legend()
+
+    axs[1].plot(t, theta_ref, label="theta_ref")
+    axs[1].plot(t, theta, label="theta")
+    axs[1].set_ylabel("Theta [rad]")
+    axs[1].grid(True)
+    axs[1].legend()
+
+    axs[2].plot(t, theta - theta_ref, label="theta error")
+    axs[2].plot(t, omega_ref, label="omega_ref")
+    axs[2].plot(t, omega, label="omega")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].set_ylabel("Error / Omega")
+    axs[2].grid(True)
+    axs[2].legend()
+    fig.suptitle(title)
+    fig.tight_layout()
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(os.path.join(save_dir, "control_rollout.png"), dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_smc_vs_rl(logs_smc, logs_rl, plant_p=None, title="SMC vs RL+SMC", save_dir=None, show=True):
+    t_smc = np.asarray(logs_smc["t"])
+    t_rl = np.asarray(logs_rl["t"])
+    fig, axs = plt.subplots(5, 1, figsize=(10, 14), sharex=False)
+
+    axs[0].plot(t_smc, logs_smc["theta_ref"], label="theta_ref")
+    axs[0].plot(t_smc, logs_smc["theta"], label="theta_smc")
+    axs[0].plot(t_rl, logs_rl["theta"], label="theta_rl")
+    axs[0].set_ylabel("Theta")
+    axs[0].grid(True); axs[0].legend()
+
+    axs[1].plot(t_smc, np.asarray(logs_smc["theta"]) - np.asarray(logs_smc["theta_ref"]), label="theta err smc")
+    axs[1].plot(t_rl, np.asarray(logs_rl["theta"]) - np.asarray(logs_rl["theta_ref"]), label="theta err rl")
+    axs[1].set_ylabel("Theta error")
+    axs[1].grid(True); axs[1].legend()
+
+    axs[2].plot(t_smc, logs_smc["omega_ref"], label="omega_ref")
+    axs[2].plot(t_smc, logs_smc["omega"], label="omega_smc")
+    axs[2].plot(t_rl, logs_rl["omega"], label="omega_rl")
+    axs[2].set_ylabel("Omega")
+    axs[2].grid(True); axs[2].legend()
+
+    axs[3].plot(t_smc, logs_smc["u_total"], label="u_total_smc")
+    axs[3].plot(t_rl, logs_rl["u_total"], label="u_total_rl")
+    if plant_p is not None:
+        axs[3].axhline(plant_p.u_max, color="k", linestyle="--", label="+u_max")
+        axs[3].axhline(-plant_p.u_max, color="k", linestyle="--", label="-u_max")
+    axs[3].set_ylabel("u_total")
+    axs[3].grid(True); axs[3].legend()
+
+    axs[4].plot(t_rl, logs_rl["u_rl"], label="u_rl")
+    if plant_p is not None:
+        axs[4].axhline(plant_p.u_max, color="k", linestyle="--")
+        axs[4].axhline(-plant_p.u_max, color="k", linestyle="--")
+    axs[4].set_ylabel("u_rl")
+    axs[4].set_xlabel("Time [s]")
+    axs[4].grid(True); axs[4].legend()
+    fig.suptitle(title)
+    fig.tight_layout()
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(os.path.join(save_dir, "smc_vs_rl.png"), dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_training_history(history, save_dir=None, show=True):
+    ep = np.asarray(history["episode"])
+    if len(ep) == 0:
+        print("No history to plot.")
+        return
+    figs = []
+    def _mk():
+        fig, ax = plt.subplots(figsize=(8, 4))
+        figs.append(fig)
+        return fig, ax
+
+    fig, ax = _mk(); ax.plot(ep, history["train_cost"], label="train_cost"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode"); ax.set_ylabel("Cost")
+    fig, ax = _mk(); ax.plot(ep, history["eval_smc_cost"], label="eval_smc_cost"); ax.plot(ep, history["eval_rl_cost"], label="eval_rl_cost"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode"); ax.set_ylabel("Cost")
+    fig, ax = _mk(); ax.plot(ep, np.asarray(history["eval_rl_cost"]) - np.asarray(history["eval_smc_cost"]), label="eval_rl - eval_smc"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode"); ax.set_ylabel("Delta cost")
+    fig, ax = _mk(); ax.plot(ep, history["mean_abs_u_rl"], label="mean|u_rl|"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode")
+    fig, ax = _mk(); ax.plot(ep, history["max_abs_u_rl"], label="max|u_rl|"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode")
+    fig, ax = _mk(); ax.plot(ep, history["saturation_fraction"], label="saturation fraction"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode")
+    fig, ax = _mk(); ax.plot(ep, history["buffer"], label="replay buffer"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode")
+    fig, ax = _mk(); ax.plot(ep, history["eval_rl_finished"], label="finished flag"); ax.grid(True); ax.legend(); ax.set_xlabel("Episode")
+    for fig in figs:
+        fig.tight_layout()
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        names = [
+            "train_cost", "eval_costs", "eval_gap", "mean_abs_u_rl",
+            "max_abs_u_rl", "saturation_fraction", "buffer", "finished",
+        ]
+        for fig, name in zip(figs, names):
+            fig.savefig(os.path.join(save_dir, f"{name}.png"), dpi=150)
+    if show:
+        plt.show()
+    else:
+        for fig in figs:
+            plt.close(fig)
+
+
 # -------------------------
 # Training & saving
 # -------------------------
@@ -518,6 +674,7 @@ def train_and_save(
     total_steps: int = 60000,
     start_random_steps: int = 2000,
     seed: int = 0,
+    plot_save_dir: Optional[str] = None,
 ):
     """Train chosen agent type on the specified task, then save it under `agent_name`.
 
@@ -544,11 +701,20 @@ def train_and_save(
         print(f"Saved SIMPLE agent as '{agent_name}' in ./{AGENTS_DIR}")
 
     elif agent_type == 'sac':
-        agent = make_agent('sac', u_rl_max=0.18)
-        dt = plant.p.dt
-        steps_per_ep = int(round(task.horizon_s / dt))
+        agent = make_agent('sac', u_rl_max=0.35)
         print(f"Training SAC residual RL until {total_steps} transitions...")
         ep = 0
+        history = {
+            "episode": [],
+            "train_cost": [],
+            "eval_smc_cost": [],
+            "eval_rl_cost": [],
+            "eval_rl_finished": [],
+            "buffer": [],
+            "mean_abs_u_rl": [],
+            "max_abs_u_rl": [],
+            "saturation_fraction": [],
+        }
         while getattr(agent, 'replay').len < total_steps:
             ep += 1
             metrics, _ = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, seed=seed+ep, collect_logs=False, training=True)
@@ -564,7 +730,7 @@ def train_and_save(
                     theta_goal=task.theta_goal,
                     seed=999,
                 )
-                eval_rl, _ = evaluate_fixed_case(
+                eval_rl, eval_rl_logs = evaluate_fixed_case(
                     agent=agent,
                     plant_p=plant_p,
                     nom=nom,
@@ -574,17 +740,49 @@ def train_and_save(
                     theta_goal=task.theta_goal,
                     seed=999,
                 )
+                u_total = np.asarray(eval_rl_logs["u_total"])
+                u_rl = np.asarray(eval_rl_logs["u_rl"])
+                sat_frac = float(np.mean(np.abs(u_total) >= plant_p.u_max - 1e-9))
+                mean_abs_u_rl = float(np.mean(np.abs(u_rl)))
+                max_abs_u_rl = float(np.max(np.abs(u_rl)))
+                history["episode"].append(ep)
+                history["train_cost"].append(metrics["total_cost"])
+                history["eval_smc_cost"].append(eval_smc["total_cost"])
+                history["eval_rl_cost"].append(eval_rl["total_cost"])
+                history["eval_rl_finished"].append(eval_rl["finished"])
+                history["buffer"].append(buf_len)
+                history["mean_abs_u_rl"].append(mean_abs_u_rl)
+                history["max_abs_u_rl"].append(max_abs_u_rl)
+                history["saturation_fraction"].append(sat_frac)
                 print(
                     f"Ep {ep:03d}: "
                     f"train_cost={metrics['total_cost']:.4f}, "
                     f"eval_smc={eval_smc['total_cost']:.4f}, "
                     f"eval_rl={eval_rl['total_cost']:.4f}, "
                     f"finished_rl={int(eval_rl['finished'])}, "
-                    f"buffer={buf_len}"
+                    f"buffer={buf_len}, "
+                    f"mean_abs_u_rl={mean_abs_u_rl:.5f}, "
+                    f"max_abs_u_rl={max_abs_u_rl:.5f}, "
+                    f"sat_frac={sat_frac:.3f}"
                 )
         agent.save(agent_name, out_dir=AGENTS_DIR)
         save_meta(agent_name, {"type": "sac", "u_rl_max": agent.cfg.u_rl_max})
         print(f"Saved SAC agent as '{agent_name}' in ./{AGENTS_DIR}")
+        eval_smc, logs_smc = evaluate_fixed_case(
+            agent=None, plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg, cost_cfg=cost_cfg,
+            theta_goal=task.theta_goal, seed=999,
+        )
+        eval_rl, logs_rl = evaluate_fixed_case(
+            agent=agent, plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg, cost_cfg=cost_cfg,
+            theta_goal=task.theta_goal, seed=999,
+        )
+        print("=== Deterministic SMC-only diagnostics ===")
+        print_rollout_diagnostics(logs_smc, plant_p)
+        print("=== Deterministic RL+SMC diagnostics ===")
+        print_rollout_diagnostics(logs_rl, plant_p)
+        plot_control_rollout(logs_rl, plant_p=plant_p, title="RL+SMC control rollout", save_dir=plot_save_dir)
+        plot_smc_vs_rl(logs_smc, logs_rl, plant_p=plant_p, title="SMC-only vs RL+SMC", save_dir=plot_save_dir)
+        plot_training_history(history, save_dir=plot_save_dir)
     else:
         raise ValueError("agent_type must be 'simple' or 'sac'")
 
@@ -641,8 +839,13 @@ def default_params():
     plant_p = PlantParams(J=0.045, b=0.09, u_max=0.8, omega_max=8.0, dt=0.002)
     nom = NominalModel(J=0.05, b=0.06)
     lqr_w = LQRWeights(q_theta=80.0, q_omega=15.0, r_u=0.02, qT_theta=4000.0, qT_omega=200.0)
-    smc_cfg = SMCConfig(lambda_s=40.0, k=0.8, phi=0.03, delay_steps=3)
-    cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
+    smc_cfg = SMCConfig(
+        lambda_s=20.0,
+        k=0.25,
+        phi=0.06,
+        delay_steps=3,
+    )
+    cost_cfg = CostConfig()
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
 if __name__ == "__main__":
