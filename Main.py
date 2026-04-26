@@ -171,7 +171,7 @@ def generate_reference_ilqr_like(
     x = x0.copy()
     for k in range(N):
         x_tilde = x - x_goal
-        u = float(-Ks[k] @ x_tilde.reshape(2, 1))
+        u = float((-Ks[k] @ x_tilde.reshape(2, 1)).item())
         u = sat(u, plant_limits.u_max)
         x = A @ x + B.flatten() * u
         x_ref[k, :] = x
