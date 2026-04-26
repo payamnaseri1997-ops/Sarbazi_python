@@ -39,18 +39,87 @@ def finite_diff(y: np.ndarray, dt: float) -> np.ndarray:
 
 @dataclass
 class PlantParams:
-    """True plant parameters used inside the simulator.
-    J: inertia [kg·m^2]
-    b: viscous damping [N·m·s/rad]
-    u_max: absolute torque limit [N·m]
-    omega_max: soft speed limit used in cost function [rad/s]
-    dt: control / integration time step [s]
+    """True plant + actuator parameters used inside the simulator.
+
+    Parameters
+    ----------
+    J : float
+        Rotor inertia [kg·m²].
+    b : float
+        Viscous damping [N·m·s/rad].
+    u_max : float
+        Servo command magnitude limit (torque reference) [N·m].
+    omega_max : float
+        Soft speed limit used in cost function [rad/s].
+    dt : float
+        Control / integration time step [s].
+    tau_i : float
+        Time constant of the first-order current/torque loop [s].
+    K_t : float
+        Motor torque constant translating command units to [N·m].
+    m1 : float, optional
+        Grey base mass contributing to inertia [kg].
+    R1 : float, optional
+        Grey base radius measured from the spin axis [m].
+    m2 : float, optional
+        Blue post mass located at offset ``r1`` [kg].
+    a2 : float, optional
+        Blue post local radius used for its own polar inertia [m].
+    r1 : float, optional
+        Blue post radial offset from the spin axis [m].
+    m3 : float, optional
+        Orange post mass located at offset ``r2`` [kg].
+    a3 : float, optional
+        Orange post local radius [m].
+    r2 : float, optional
+        Orange post radial offset from the spin axis [m].
+    m4 : float, optional
+        Red link mass treated as a slender bar [kg].
+    L4 : float, optional
+        Red link total length for the in-plane inertia calculation [m].
+    l4_c : float, optional
+        Red link centre-of-mass distance from the joint along the link [m].
+    gamma : float, optional
+        Red link COM azimuth in the plane relative to the orange post [rad].
+    beta2 : float, optional
+        In-plane azimuth of the blue post COM relative to the spin axis [rad].
+    beta4 : float, optional
+        In-plane azimuth of the red link COM relative to the spin axis [rad].
+    alpha : float, optional
+        Platform roll tilt angle (rotation about x) [rad].
+    phi : float, optional
+        Platform pitch tilt angle (rotation about y) [rad].
+    g : float, optional
+        Gravity magnitude used for tilt loading [m/s²].
+    subtract_gravity_in_ueq : bool, optional
+        Enable pre-cancellation of gravity inside ``u_eq`` when ``True``.
     """
+
     J: float
     b: float
     u_max: float
     omega_max: float
     dt: float
+    tau_i: float
+    K_t: float
+    m1: float = 2.0     # [kg] Grey base mass (solid disk)
+    R1: float = 0.10    # [m] Grey base radius
+    m2: float = 0.5     # [kg] Blue post mass
+    a2: float = 0.01    # [m] Blue post local radius
+    r1: float = 0.07    # [m] Blue post radial offset from spin axis
+    m3: float = 0.8     # [kg] Orange post mass
+    a3: float = 0.015   # [m] Orange post local radius
+    r2: float = 0.08    # [m] Orange post radial offset from spin axis
+    m4: float = 0.4     # [kg] Red link mass (slender bar)
+    L4: float = 0.20    # [m] Red link length
+    l4_c: float = 0.10  # [m] Red link COM distance from hinge along the link
+    gamma: float = 0.0  # [rad] Red link COM azimuth w.r.t orange post
+    beta2: float = 0.0  # [rad] Blue post COM azimuth about spin axis
+    beta4: float = 0.0  # [rad] Red link COM azimuth about spin axis
+    alpha: float = math.radians(5.0)  # [rad] Platform roll tilt
+    phi: float = math.radians(3.0)    # [rad] Platform pitch tilt
+    g: float = 9.81                   # [m/s²] Gravity magnitude
+    subtract_gravity_in_ueq: bool = False  # Gravity handled by TDE when False
 
 @dataclass
 class NominalModel:
@@ -58,18 +127,69 @@ class NominalModel:
     J: float
     b: float
 
-class OneDOFRotorPlant:
-    """True 1-DoF second-order rotational system with disturbances.
 
-    State: x = [theta, omega]
-    Dynamics: J * domega = u - b*omega + d(t)
-    Disturbance d(t) includes Coulomb friction, periodic load, an additional
-    sinusoid with time-varying amplitude and frequency (to mimic unmodeled
-    dynamics), and white torque noise.
+def J_local_cylinder_z(m: float, a: float) -> float:
+    """Polar moment about the local cylinder axis (solid)."""
+    return 0.5 * m * a * a
+
+
+def J_bar_inplane_COM(m: float, L: float) -> float:
+    """Polar inertia of a slender bar in-plane about its COM."""
+    return (1.0 / 12.0) * m * L * L
+
+
+def red_link_radius_from_pin(r2: float, l_c: float, gamma: float) -> float:
+    """Horizontal distance from base axis to the red link COM."""
+    return math.sqrt(max(0.0, r2 * r2 + l_c * l_c + 2.0 * r2 * l_c * math.cos(gamma)))
+
+
+def compute_equivalent_inertia(p: PlantParams) -> float:
+    """Combine geometry contributions into the rotor equivalent inertia."""
+    J1 = 0.5 * p.m1 * p.R1 * p.R1 if p.m1 > 0 and p.R1 > 0 else 0.0
+    J2_local = J_local_cylinder_z(p.m2, p.a2) if p.m2 > 0 else 0.0
+    J3_local = J_local_cylinder_z(p.m3, p.a3) if p.m3 > 0 else 0.0
+    R4 = red_link_radius_from_pin(p.r2, p.l4_c, p.gamma) if p.m4 > 0 else 0.0
+    J4_com = J_bar_inplane_COM(p.m4, p.L4) if p.m4 > 0 else 0.0
+    J2 = J2_local + p.m2 * p.r1 * p.r1
+    J3 = J3_local + p.m3 * p.r2 * p.r2
+    J4 = J4_com + p.m4 * R4 * R4
+    return J1 + J2 + J3 + J4
+
+
+def gravity_proj_inplane(alpha: float, phi: float, g: float) -> Tuple[float, float]:
+    """Project gravity into the rotor plane given base tilt angles."""
+    gx = -g * math.sin(phi)
+    gy = g * math.sin(alpha) * math.cos(phi)
+    psi = math.atan2(gy, gx)
+    g_t = math.hypot(gx, gy)
+    return g_t, psi
+
+
+class OneDOFRotorPlant:
+    """True 1-DoF rotational system with a first-order torque servo.
+
+    State vector: ``x = [theta, omega, tau_m]`` where ``tau_m`` is the actual
+    shaft torque generated by the actuator.  The control input is the servo
+    torque command ``u`` that is filtered by the first-order loop.
+
+    Mechanical dynamics:
+
+    ``omega[k+1] = omega[k] + dt/J * (tau_m[k] - b * omega[k] + d[k])``
+    ``theta[k+1] = theta[k] + dt * omega[k+1]``
+
+    Servo current/torque loop:
+
+    ``tau_m[k+1] = tau_m[k] + dt * (-(1/tau_i) * tau_m[k] + (K_t/tau_i) * u[k])``
+
+    Disturbance ``d[k]`` follows the same structure as the previous
+    implementation (Coulomb friction, periodic loads, slowly varying
+    components, and white torque noise).
     """
+
     def __init__(self, p: PlantParams):
         self.p = p
-        self.state = np.zeros(2)  # [theta, omega]
+        self.state = np.zeros(3)  # [theta, omega, tau_m]
+        self.J_eq = compute_equivalent_inertia(self.p)
         # Disturbance parameters (tune as needed)
         self.torque_coulomb = 0.02  # Nm
         self.load_amp = 0.03        # Nm
@@ -84,16 +204,48 @@ class OneDOFRotorPlant:
         self.extra_freq_mod_freq = 0.05  # Hz, frequency modulation frequency
         self.time = 0.0
         self.last_disturbance = 0.0
+        self.last_tau_m = 0.0
+        self.last_command = 0.0
+        self.last_gravity = 0.0
 
-    def reset(self, theta0: float = 0.0, omega0: float = 0.0) -> np.ndarray:
+    def gravity_torque(self, theta: float) -> float:
+        g_t, psi = gravity_proj_inplane(self.p.alpha, self.p.phi, self.p.g)
+        R4 = (
+            red_link_radius_from_pin(self.p.r2, self.p.l4_c, self.p.gamma)
+            if self.p.m4 > 0
+            else 0.0
+        )
+        tau2 = (
+            self.p.m2 * self.p.r1 * g_t * math.sin(theta + self.p.beta2 - psi)
+            if self.p.m2 > 0
+            else 0.0
+        )
+        tau4 = (
+            self.p.m4 * R4 * g_t * math.sin(theta + self.p.beta4 - psi)
+            if self.p.m4 > 0
+            else 0.0
+        )
+        return tau2 + tau4
+
+    def reset(
+        self,
+        theta0: float = 0.0,
+        omega0: float = 0.0,
+        tau_m0: float = 0.0,
+    ) -> np.ndarray:
         """Reset the plant state.
         theta0: initial angle [rad]
         omega0: initial angular velocity [rad/s]
+        tau_m0: initial actuator torque [N·m]
         Returns the current state copy.
         """
-        self.state[:] = [theta0, omega0]
+        self.state[:] = [theta0, omega0, tau_m0]
+        self.J_eq = compute_equivalent_inertia(self.p)
         self.time = 0.0
         self.last_disturbance = 0.0
+        self.last_tau_m = tau_m0
+        self.last_command = 0.0
+        self.last_gravity = 0.0
         return self.state.copy()
 
     def step(self, u_cmd: float) -> np.ndarray:
@@ -102,7 +254,7 @@ class OneDOFRotorPlant:
         Returns the updated state copy.
         """
         u = sat(u_cmd, self.p.u_max)
-        theta, omega = self.state
+        theta, omega, tau_m = self.state
         # Disturbances
         d_coul = self.torque_coulomb * (1.0 if omega >= 0 else -1.0) if abs(omega) > 1e-5 else 0.0
         d_per = self.load_amp * math.sin(2.0 * math.pi * self.load_freq * self.time)
@@ -118,14 +270,21 @@ class OneDOFRotorPlant:
         )
         d_var = amp_var * math.sin(2.0 * math.pi * freq_var * self.time)
         d_noise = np.random.randn() * self.noise_std
-        d = d_coul + d_per + d_var + d_noise
+        tau_g = self.gravity_torque(theta)
+        d = d_coul + d_per + d_var + d_noise + tau_g
         self.last_disturbance = d
+        self.last_tau_m = tau_m
+        self.last_command = u
+        self.last_gravity = tau_g
 
         # Dynamics integration (semi-implicit Euler)
-        domega = (u - self.p.b * omega + d) / self.p.J
+        domega = (tau_m - self.p.b * omega + d) / self.J_eq
         omega_next = omega + domega * self.p.dt
         theta_next = theta + omega_next * self.p.dt
-        self.state[:] = [theta_next, omega_next]
+        tau_m_next = tau_m + self.p.dt * (
+            -(1.0 / self.p.tau_i) * tau_m + (self.p.K_t / self.p.tau_i) * u
+        )
+        self.state[:] = [theta_next, omega_next, tau_m_next]
         self.time += self.p.dt
         return self.state.copy()
 
@@ -213,67 +372,100 @@ class SMCConfig:
     lambda_s: surface slope (>0). Higher = faster convergence but more control effort.
     k: sliding gain (>0). Higher = stronger attraction to surface; too high may chatter.
     phi: boundary layer half-width for smooth sat (tanh). Larger = smoother, more steady-state error.
-    delay_steps: integer delay in steps for TDE derivative/backshift.
     """
     lambda_s: float = 30.0
     k: float = 0.6
     phi: float = 0.02
-    delay_steps: int = 2
 
-class TDE_SMC_Controller:
-    """Time-Delay Estimator augmented SMC.
+class TDE_SMC_Discrete:
+    """Discrete-time TDE + SMC controller aware of actuator dynamics."""
 
-    Control law: u = u_eq - d_hat + u_s + u_RL
-    where
-        s = (ω - ω_ref) + λ (θ - θ_ref),
-        u_eq ≈ J_nom (α_ref - λ (ω - ω_ref)) + b_nom ω,
-        d_hat is TDE disturbance estimate using delayed (ω, u),
-        u_s = -k * tanh(s/φ) is continuous sliding action,
-        u_RL is the residual torque from the RL agent.
-    """
-    def __init__(self, nom: NominalModel, limits: PlantParams, smc: SMCConfig):
-        self.nom = nom
-        self.limits = limits
+    def __init__(
+        self,
+        hatJ: float,
+        hatb: float,
+        dt: float,
+        u_max: float,
+        tau_i: float,
+        K_t: float,
+        smc: SMCConfig,
+    ):
+        self.hatJ = hatJ
+        self.hatb = hatb
+        self.dt = dt
+        self.u_max = u_max
+        self.tau_i = tau_i
+        self.K_t = K_t
         self.cfg = smc
-        self._omega_hist: List[float] = []
-        self._u_hist: List[float] = []
+        self.tau_m_hat: float = 0.0
+        self.omega_hist: List[float] = []
+        self.tau_m_hat_hist: List[float] = []
+        self.subtract_gravity_in_ueq: bool = False
 
     def reset(self):
-        self._omega_hist.clear()
-        self._u_hist.clear()
+        self.tau_m_hat = 0.0
+        self.omega_hist.clear()
+        self.tau_m_hat_hist.clear()
 
-    def control(self,
-                theta: float, omega: float,
-                theta_ref: float, omega_ref: float, alpha_ref: float,
-                u_rl: float) -> Tuple[float, Dict[str, float]]:
-        e = theta - theta_ref
-        edot = omega - omega_ref
+    def control(
+        self,
+        theta: float,
+        omega: float,
+        theta_ref_k: float,
+        theta_ref_k1: float,
+        omega_ref_k: float,
+        omega_ref_k1: float,
+        u_rl: float = 0.0,
+        plant: Optional[OneDOFRotorPlant] = None,
+    ) -> Tuple[float, Dict[str, float]]:
+        e = theta - theta_ref_k
+        edot = omega - omega_ref_k
         s = edot + self.cfg.lambda_s * e
 
-        # Equivalent control using nominal model
-        u_eq = self.nom.J * (alpha_ref - self.cfg.lambda_s * edot) + self.nom.b * omega
+        self.omega_hist.append(omega)
+        if len(self.omega_hist) > 2:
+            self.omega_hist.pop(0)
 
-        # TDE estimate
-        self._omega_hist.append(omega)
-        self._u_hist.append(0.0)  # placeholder; overwritten below
+        eta_hat = 0.0
         d_hat = 0.0
-        m = self.cfg.delay_steps
-        if len(self._omega_hist) > m:
-            omega_now = self._omega_hist[-1]
-            omega_del = self._omega_hist[-1 - m]
-            u_del = self._u_hist[-1 - m]
-            omega_dot_del = (omega_now - omega_del) / (m * self.limits.dt)
-            d_hat = self.nom.J * omega_dot_del - u_del + self.nom.b * omega_del
+        if self.tau_m_hat_hist:
+            eta_hat = self.tau_m_hat_hist[-1] - self.hatJ * self.omega_hist[-1]
+            d_hat = eta_hat - self.hatb * omega
 
-        # Sliding action
+        dtheta_ref = theta_ref_k1 - theta_ref_k
+        domega_ref = omega_ref_k1 - omega_ref_k
+        denom = self.dt * (1.0 + self.cfg.lambda_s * self.dt)
+        u_eq = self.hatb * omega + (self.hatJ / denom) * (
+            domega_ref - self.cfg.lambda_s * (self.dt * omega - dtheta_ref)
+        )
+        if getattr(self, "subtract_gravity_in_ueq", False) and plant is not None:
+            u_eq = u_eq - plant.gravity_torque(theta)
+
         s_norm = s / (self.cfg.phi + 1e-9)
         u_s = -self.cfg.k * np.tanh(s_norm)
 
-        u_total = u_eq - d_hat + u_s + u_rl
-        u_total = sat(u_total, self.limits.u_max)
-        self._u_hist[-1] = u_total
+        u_total = sat(u_eq - d_hat + u_s + u_rl, self.u_max)
 
-        info = dict(e=e, edot=edot, s=s, d_hat=d_hat, u_eq=u_eq, u_s=u_s, u_smc=u_eq - d_hat + u_s)
+        tau_m_hat_prev = self.tau_m_hat
+        tau_m_hat_next = tau_m_hat_prev + self.dt * (
+            -(1.0 / self.tau_i) * tau_m_hat_prev + (self.K_t / self.tau_i) * u_total
+        )
+        self.tau_m_hat = tau_m_hat_next
+        self.tau_m_hat_hist.append(tau_m_hat_next)
+        if len(self.tau_m_hat_hist) > 2:
+            self.tau_m_hat_hist.pop(0)
+
+        info = dict(
+            e=e,
+            edot=edot,
+            s=s,
+            eta_hat=eta_hat,
+            d_hat=d_hat,
+            u_eq=u_eq,
+            u_s=u_s,
+            u_smc=u_eq - d_hat + u_s,
+            u_total=u_total,
+        )
         return u_total, info
 
 # -------------------------
@@ -359,9 +551,9 @@ def rollout_once(
     Returns (metrics, logs)
       metrics: dict with total_cost, finished (0/1), time
       logs (if collect_logs=True): dict of arrays with keys:
-        't', 'theta_ref', 'omega_ref', 'alpha_ref', 'theta', 'omega',
-        'u_rl', 'u_eq', 'u_s', 'd_hat', 'u_tde', 'u_smc', 'u_total',
-        'disturbance', 'reference_kind'
+        't', 'theta_ref', 'omega_ref', 'alpha_ref', 'theta', 'omega', 'tau_m',
+        'u_rl', 'u_eq', 'u_s', 's', 'eta_hat', 'd_hat', 'u_tde', 'u_smc',
+        'u_total', 'disturbance', 'gravity', 'reference_kind'
     """
     np.random.seed(seed)
     dt = plant.p.dt
@@ -370,6 +562,9 @@ def rollout_once(
 
     # Reference trajectory: optimized iLQR by default, optional custom profiles otherwise
     ref_opts = {} if reference is None else dict(reference)
+    if 'duration' in ref_opts:
+        horizon_s = float(ref_opts['duration'])
+        N = int(round(horizon_s / dt))
     ref_kind_input = ref_opts.get('kind', 'ilqr')
     ref_kind_lower = str(ref_kind_input).lower() if ref_kind_input is not None else 'ilqr'
     has_theta_sequence = 'theta' in ref_opts
@@ -444,7 +639,16 @@ def rollout_once(
     omega_ref = finite_diff(theta_ref, dt)
     alpha_ref = finite_diff(omega_ref, dt)
 
-    smc = TDE_SMC_Controller(nom, plant.p, smc_cfg)
+    smc = TDE_SMC_Discrete(
+        hatJ=nom.J,
+        hatb=nom.b,
+        dt=plant.p.dt,
+        u_max=plant.p.u_max,
+        tau_i=plant.p.tau_i,
+        K_t=plant.p.K_t,
+        smc=smc_cfg,
+    )
+    smc.subtract_gravity_in_ueq = plant.p.subtract_gravity_in_ueq
     smc.reset()
     plant.reset(theta0=task.theta0, omega0=task.omega0)
 
@@ -456,61 +660,87 @@ def rollout_once(
         al_ref_log = np.zeros(N)
         th_log = np.zeros(N)
         om_log = np.zeros(N)
+        tau_m_log = np.zeros(N)
         u_rl_log = np.zeros(N)
         u_eq_log = np.zeros(N)
         u_s_log = np.zeros(N)
+        s_log = np.zeros(N)
+        eta_hat_log = np.zeros(N)
         d_hat_log = np.zeros(N)
         u_tde_log = np.zeros(N)
         u_smc_log = np.zeros(N)
         u_total_log = np.zeros(N)
         dist_log = np.zeros(N)
+        gravity_log = np.zeros(N)
 
     total_cost = 0.0
     done = False
     t = 0.0
+    steps_taken = 0
+    u_rl_limit = 0.2 * plant.p.u_max
 
     if agent is not None:
         agent.begin_episode()
 
     for k in range(N):
-        theta, omega = plant.state.copy()
+        theta, omega, tau_m = plant.state.copy()
+        theta_ref_k = theta_ref[k]
+        theta_ref_k1 = theta_ref[min(k + 1, N)]
+        omega_ref_k = omega_ref[k]
+        omega_ref_k1 = omega_ref[min(k + 1, N)]
         obs = dict(
-            e=theta - theta_ref[k],
-            edot=omega - omega_ref[k],
-            s=(omega - omega_ref[k]) + smc_cfg.lambda_s * (theta - theta_ref[k]),
+            e=theta - theta_ref_k,
+            edot=omega - omega_ref_k,
+            s=(omega - omega_ref_k) + smc_cfg.lambda_s * (theta - theta_ref_k),
             omega=omega,
+            tau_m=tau_m,
             time_frac=float(k) / max(1, N - 1),
         )
-        # feature vector for storage (SAC needs ndarray form)
         o = np.array([obs['e'], obs['edot'], obs['s'], obs['omega'], 1.0, obs['time_frac']], dtype=np.float32)
         o = np.clip(o, -5.0, 5.0)
 
-        u_rl = 0.0 if agent is None else agent.act(obs, eval=False)
-        u_cmd, info = smc.control(theta, omega, theta_ref[k], omega_ref[k], alpha_ref[k], u_rl)
+        if agent is None:
+            u_rl = 0.0
+        else:
+            u_rl = float(agent.act(obs, eval=False))
+            u_rl = sat(u_rl, u_rl_limit)
+
+        u_cmd, info = smc.control(
+            theta,
+            omega,
+            theta_ref_k,
+            theta_ref_k1,
+            omega_ref_k,
+            omega_ref_k1,
+            u_rl,
+            plant=plant,
+        )
         plant.step(u_cmd)
 
-        # stage cost (negative reward)
-        e = info['e']; edot = info['edot']
-        stage = (cost_cfg.w_e * e * e
-                 + cost_cfg.w_edot * edot * edot
-                 + cost_cfg.w_omega * omega * omega
-                 + cost_cfg.w_u * u_cmd * u_cmd)
+        e = info['e']
+        edot = info['edot']
+        stage = (
+            cost_cfg.w_e * e * e
+            + cost_cfg.w_edot * edot * edot
+            + cost_cfg.w_omega * omega * omega
+            + cost_cfg.w_u * info['u_total'] * info['u_total']
+        )
         r = -stage * dt
         total_cost += stage * dt
 
-        # next obs for agent
-        theta2, omega2 = plant.state.copy()
+        theta2, omega2, _ = plant.state.copy()
+        next_idx = min(k + 1, N - 1)
         obs2 = dict(
-            e=theta2 - theta_ref[min(k+1, N-1)],
-            edot=omega2 - omega_ref[min(k+1, N-1)],
-            s=(omega2 - omega_ref[min(k+1, N-1)]) + smc_cfg.lambda_s * (theta2 - theta_ref[min(k+1, N-1)]),
+            e=theta2 - theta_ref[next_idx],
+            edot=omega2 - omega_ref[next_idx],
+            s=(omega2 - omega_ref[next_idx]) + smc_cfg.lambda_s * (theta2 - theta_ref[next_idx]),
             omega=omega2,
-            time_frac=float(min(k+1, N-1)) / max(1, N - 1),
+            tau_m=plant.last_tau_m,
+            time_frac=float(next_idx) / max(1, N - 1),
         )
         o2 = np.array([obs2['e'], obs2['edot'], obs2['s'], obs2['omega'], 1.0, obs2['time_frac']], dtype=np.float32)
         o2 = np.clip(o2, -5.0, 5.0)
 
-        # terminal condition
         if (abs(theta2 - task.theta_goal) < cost_cfg.goal_tol) and (abs(omega2) < cost_cfg.goal_tol):
             done = True
 
@@ -520,20 +750,25 @@ def rollout_once(
 
         if collect_logs:
             t_log[k] = t
-            th_ref_log[k] = theta_ref[k]
-            om_ref_log[k] = omega_ref[k]
+            th_ref_log[k] = theta_ref_k
+            om_ref_log[k] = omega_ref_k
             al_ref_log[k] = alpha_ref[k]
             th_log[k] = theta
             om_log[k] = omega
+            tau_m_log[k] = tau_m
             u_rl_log[k] = u_rl
             u_eq_log[k] = info['u_eq']
             u_s_log[k] = info['u_s']
+            s_log[k] = info['s']
+            eta_hat_log[k] = info['eta_hat']
             d_hat_log[k] = info['d_hat']
             u_tde_log[k] = -info['d_hat']
             u_smc_log[k] = info['u_smc']
-            u_total_log[k] = u_cmd
+            u_total_log[k] = info['u_total']
             dist_log[k] = plant.last_disturbance
+            gravity_log[k] = plant.last_gravity
 
+        steps_taken = k + 1
         if done:
             break
         t += dt
@@ -544,12 +779,27 @@ def rollout_once(
     metrics = dict(total_cost=total_cost, finished=1.0 if done else 0.0, time=t)
     logs = None
     if collect_logs:
+        steps = steps_taken
         logs = dict(
-            t=t_log[:k+1], theta_ref=th_ref_log[:k+1], omega_ref=om_ref_log[:k+1], alpha_ref=al_ref_log[:k+1],
-            theta=th_log[:k+1], omega=om_log[:k+1],
-            u_rl=u_rl_log[:k+1], u_eq=u_eq_log[:k+1], u_s=u_s_log[:k+1], d_hat=d_hat_log[:k+1],
-            u_tde=u_tde_log[:k+1], u_smc=u_smc_log[:k+1], u_total=u_total_log[:k+1],
-            disturbance=dist_log[:k+1], reference_kind=reference_kind
+            t=t_log[:steps],
+            theta_ref=th_ref_log[:steps],
+            omega_ref=om_ref_log[:steps],
+            alpha_ref=al_ref_log[:steps],
+            theta=th_log[:steps],
+            omega=om_log[:steps],
+            tau_m=tau_m_log[:steps],
+            u_rl=u_rl_log[:steps],
+            u_eq=u_eq_log[:steps],
+            u_s=u_s_log[:steps],
+            s=s_log[:steps],
+            eta_hat=eta_hat_log[:steps],
+            d_hat=d_hat_log[:steps],
+            u_tde=u_tde_log[:steps],
+            u_smc=u_smc_log[:steps],
+            u_total=u_total_log[:steps],
+            disturbance=dist_log[:steps],
+            gravity=gravity_log[:steps],
+            reference_kind=reference_kind,
         )
     return metrics, logs
 
@@ -688,10 +938,10 @@ def evaluate_and_rollout(
     Returns a dictionary with arrays (each length ~ steps):
       - 't' : time [s]
       - 'theta_ref', 'omega_ref', 'alpha_ref'
-      - 'theta', 'omega'                (actual plant)
-      - 'u_eq', 'd_hat', 'u_tde', 'u_s', 'u_smc' (SMC/TDE components)
-      - 'u_rl'                           (RL residual)
-      - 'u_total', 'disturbance'        (applied torque & actual disturbance)
+      - 'theta', 'omega', 'tau_m'       (actual plant)
+      - 'u_eq', 'u_s', 's', 'eta_hat', 'd_hat', 'u_tde', 'u_smc'
+      - 'u_rl'                          (RL residual)
+      - 'u_total', 'disturbance', 'gravity'        (command, total disturbance, gravity torque)
     """
     agent: Optional[ResidualAgentAPI] = None
     if agent_name is not None and agent_name.lower() != 'none':
@@ -716,18 +966,6 @@ def evaluate_and_rollout(
     )
     logs['metrics'] = metrics
     return logs
-
-# -------------------------
-# Default parameter presets (you can tweak in one place)
-# -------------------------
-
-def default_params():
-    plant_p = PlantParams(J=0.045, b=0.09, u_max=0.8, omega_max=8.0, dt=0.002)
-    nom = NominalModel(J=0.05, b=0.06)
-    lqr_w = LQRWeights(q_theta=80.0, q_omega=15.0, r_u=0.02, qT_theta=4000.0, qT_omega=200.0)
-    smc_cfg = SMCConfig(lambda_s=40.0, k=0.8, phi=0.03, delay_steps=3)
-    cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
-    return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
 
 def plot_rollout_and_errors(
@@ -864,31 +1102,132 @@ def plot_rollout_and_errors(
 
     plt.show()
 
+#%% -------------------------
+# Default parameter presets (you can tweak in one place)
+# -------------------------
+
+def default_params():
+    plant_p = PlantParams(
+        J=0.045,
+        b=0.09,
+        u_max=0.8,
+        omega_max=8.0,
+        dt=0.002,
+        tau_i=0.01,
+        K_t=1.0,
+        m1=2.0,
+        R1=0.10,
+        m2=0.5,
+        a2=0.01,
+        r1=0.07,
+        m3=0.8,
+        a3=0.015,
+        r2=0.08,
+        m4=0.4,
+        L4=0.20,
+        l4_c=0.10,
+        gamma=0.0,
+        beta2=0.0,
+        beta4=0.0,
+        alpha=math.radians(15.0),
+        phi=math.radians(10.0),
+        g=9.81,
+        subtract_gravity_in_ueq=False,
+    )
+    
+    nom = NominalModel(J=0.05, b=0.06)
+    lqr_w = LQRWeights(q_theta=85.0, q_omega=18.0, r_u=0.02, qT_theta=4200.0, qT_omega=220.0)
+    smc_cfg = SMCConfig(lambda_s=35.0, k=0.85, phi=0.025)
+    cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
+    return plant_p, nom, lqr_w, smc_cfg, cost_cfg
+
+
+#%%
 if __name__ == "__main__":
-    # === Example usage ===
-    plant_p, nom, lqr_w, smc_cfg, cost_cfg = default_params()
-    theta0 = 0.0
-    theta_goal = math.radians(60)
-
-    # 1) Train and save a SIMPLE agent
-    # train_and_save(agent_name="demo_simple", agent_type='simple',
-    #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(90)),
-    #               cost_cfg=cost_cfg, total_steps=30000)
-
-    # 2) Train and save a SAC agent
-    # train_and_save(agent_name="demo_sac", agent_type='sac',
-    #               plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
-    #               task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(90)),
-    #               cost_cfg=cost_cfg, total_steps=60000)
-
-    # 3) Evaluate a saved agent and get all logs
+    #%%
     import matplotlib.pyplot as plt
 
+    plant_p, nom, lqr_w, smc_cfg, cost_cfg = default_params()
+    theta0 = 0.0
+    theta_goal = math.radians(90.0)
+    demo_duration = 1.2
+
+    logs_demo = evaluate_and_rollout(
+        agent_name="none",
+        theta0=theta0,
+        theta_goal=theta_goal,
+        plant_p=plant_p,
+        nom=nom,
+        lqr_w=lqr_w,
+        smc_cfg=smc_cfg,
+        cost_cfg=cost_cfg,
+        reference={"duration": demo_duration},
+        seed=0,
+    )
+
+    t = logs_demo['t']
+    theta = logs_demo['theta']
+    theta_ref = logs_demo['theta_ref']
+    omega = logs_demo['omega']
+    omega_ref = logs_demo['omega_ref']
+    u_total = logs_demo['u_total']
+    tau_m = logs_demo['tau_m']
+    s = logs_demo['s']
+    d_hat = logs_demo['d_hat']
+
+    J_u = float(np.sum(u_total ** 2) * plant_p.dt)
+    final_error = float(theta[-1] - theta_goal)
+    print(f"Demo energy metric J_u = {J_u:.4f} N·m²·s")
+    print(f"Final angle error = {final_error:.6f} rad ({math.degrees(final_error):.3f} deg)")
+
+    fig, axes = plt.subplots(4, 1, sharex=True, figsize=(9, 10))
+    fig.suptitle("Discrete TDE+SMC demo: 0 → 90° step")
+
+    axes[0].plot(t, theta, label='θ')
+    axes[0].plot(t, theta_ref, '--', label='θ_ref')
+    axes[0].set_ylabel('θ [rad]')
+    axes[0].legend(loc='best')
+
+    axes[1].plot(t, omega, label='ω')
+    axes[1].plot(t, omega_ref, '--', label='ω_ref')
+    axes[1].set_ylabel('ω [rad/s]')
+    axes[1].legend(loc='best')
+
+    axes[2].plot(t, u_total, label='u command')
+    axes[2].plot(t, tau_m, label='τ_m (shaft)')
+    axes[2].set_ylabel('Torque [N·m]')
+    axes[2].legend(loc='best')
+
+    axes[3].plot(t, s, label='s (sliding)')
+    axes[3].plot(t, d_hat, label='d̂ (disturbance estimate)')
+    axes[3].set_ylabel('SMC/TDE')
+    axes[3].set_xlabel('Time [s]')
+    axes[3].legend(loc='best')
+
+    for ax in axes:
+        ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.7)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+    #%% 1) Train and save a SIMPLE agent
+    train_and_save(agent_name="demo_simple", agent_type='simple',
+                  plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
+                  task=Task(theta0=theta0, omega0=0.0, theta_goal=math.radians(180)),
+                  cost_cfg=cost_cfg, total_steps=30000)
+
+    #%% 2) Train and save a SAC agent
+    train_and_save(agent_name="demo_sac", agent_type='sac',
+                  plant_p=plant_p, nom=nom, lqr_w=lqr_w, smc_cfg=smc_cfg,
+                  task=Task(theta0=0.0, omega0=0.0, theta_goal=math.radians(180)),
+                  cost_cfg=cost_cfg, total_steps=60000)
+
+    #%% 3) Evaluate a saved agent and get all logs with ifferent reference trajectory
+
     agent_to_evaluate = "demo_sac"  # change to the agent you saved or set to 'none'
-    custom_reference = {"kind": "piecewise_quad", "tm_frac": 0.4}
+    custom_reference = {"kind": "piecewise_quad", "tm_frac": 0.4} # "kind": "piecewise_quad" or "constant"
     comparison_setups = [
-        ("Piecewise quadratic", custom_reference),
+        ("Constant reference", custom_reference), # "Piecewise quadratic" or "Constant reference"
         ("Optimized iLQR", None),
     ]
 
@@ -996,47 +1335,4 @@ if __name__ == "__main__":
 
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
-
-    # 4) Plot agent rollout against pure TDE SMC and show errors
-    # plot_rollout_and_errors(
-    #     agent_name="demo_sac", theta0=theta0, theta_goal=theta_goal
-    # )
-
-    # 5) Plot only TDE SMC (no agent residual)
-    # plot_rollout_and_errors(
-    #     agent_name="none", theta0=theta0, theta_goal=theta_goal
-    # )
-
-    # 6) Run a rollout with pure TDE SMC and plot key signals
-    plant = OneDOFRotorPlant(plant_p)
-    task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
-    _, logs = rollout_once(plant, nom, task, lqr_w, smc_cfg, agent=None, cost_cfg=cost_cfg, seed=0, collect_logs=True)
-    t = logs['t']
-
-    # plot theta and theta_ref
-    plt.figure()
-    plt.plot(t, logs['theta'], label='theta')
-    plt.plot(t, logs['theta_ref'], '--', label='theta_ref')
-    plt.xlabel('Time [s]')
-    plt.ylabel('Theta [rad]')
-    plt.legend()
-
-    # plot remaining signals vs time
-    fig, axs = plt.subplots(3, 1, sharex=True)
-    axs[0].plot(t, logs['omega'], label='theta_dot')
-    axs[0].plot(t, logs['omega_ref'], '--', label='theta_dot_ref')
-    axs[0].set_ylabel('rad/s')
-    axs[0].legend()
-
-    axs[1].plot(t, logs['u_smc'], label='u_smc')
-    axs[1].plot(t, logs['u_tde'], label='u_TDE')
-    axs[1].plot(t, logs['u_rl'], label='u_rl')
-    axs[1].set_ylabel('Torque [Nm]')
-    axs[1].legend()
-
-    axs[2].plot(t, logs['disturbance'], label='disturbance')
-    axs[2].set_ylabel('Torque [Nm]')
-    axs[2].set_xlabel('Time [s]')
-    axs[2].legend()
-    plt.show()
 
