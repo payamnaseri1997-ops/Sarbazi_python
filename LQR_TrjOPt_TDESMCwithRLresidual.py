@@ -102,17 +102,17 @@ class PlantParams:
     dt: float
     tau_i: float
     K_t: float
-    m1: float = 2.0     # [kg] Grey base mass (solid disk)
-    R1: float = 0.10    # [m] Grey base radius
-    m2: float = 0.5     # [kg] Blue post mass
-    a2: float = 0.01    # [m] Blue post local radius
-    r1: float = 0.07    # [m] Blue post radial offset from spin axis
-    m3: float = 0.8     # [kg] Orange post mass
-    a3: float = 0.015   # [m] Orange post local radius
-    r2: float = 0.08    # [m] Orange post radial offset from spin axis
-    m4: float = 0.4     # [kg] Red link mass (slender bar)
-    L4: float = 0.20    # [m] Red link length
-    l4_c: float = 0.10  # [m] Red link COM distance from hinge along the link
+    m1: float = 5000.0     # [kg] Grey base mass (solid disk)
+    R1: float = 3.10    # [m] Grey base radius
+    m2: float = 600.5     # [kg] Blue post mass
+    a2: float = 1.5    # [m] Blue post local radius
+    r1: float = .5    # [m] Blue post radial offset from spin axis
+    m3: float = 600.8     # [kg] Orange post mass
+    a3: float = 1.5   # [m] Orange post local radius
+    r2: float = 0.5    # [m] Orange post radial offset from spin axis
+    m4: float = 300.4     # [kg] Red link mass (slender bar)
+    L4: float = 1.20    # [m] Red link length
+    l4_c: float = 0.60  # [m] Red link COM distance from hinge along the link
     gamma: float = 0.0  # [rad] Red link COM azimuth w.r.t orange post
     beta2: float = 0.0  # [rad] Blue post COM azimuth about spin axis
     beta4: float = 0.0  # [rad] Red link COM azimuth about spin axis
@@ -120,7 +120,7 @@ class PlantParams:
     phi: float = math.radians(3.0)    # [rad] Platform pitch tilt
     g: float = 9.81                   # [m/s²] Gravity magnitude
     subtract_gravity_in_ueq: bool = False  # Gravity handled by TDE when False
-
+#%%
 @dataclass
 class NominalModel:
     """Nominal model parameters used in controller/trajectory computations."""
@@ -354,7 +354,7 @@ def generate_reference_ilqr_like(
         excess = abs(x[1]) - plant_limits.omega_max
         if excess > 0:
             x_tilde[1] += w.omega_limit_penalty * excess * math.copysign(1.0, x[1])
-        u = float(-Ks[k] @ x_tilde.reshape(2, 1))
+        u = float((-Ks[k] @ x_tilde.reshape(2, 1)).item())
         u = sat(u, plant_limits.u_max)
         x = A @ x + B.flatten() * u
         x_ref[k, :] = x
@@ -810,9 +810,30 @@ def rollout_once(
 AGENTS_DIR = "agents"
 META_EXT = ".meta.json"
 
-# Import RL agents (files below in this canvas)
-from rl_simple import SimpleResidualPolicy, RLConfig as SimpleRLConfig
-from rl_sac import SACResidualPolicy, SACConfig
+# Import residual-control RL agents if available.
+# They are not needed for trj_type={"LQR", "NN", "RL"} trajectory selection,
+# but the old residual-agent training helpers still use them.
+try:
+    from rl_simple import SimpleResidualPolicy, RLConfig as SimpleRLConfig
+except Exception:
+    class SimpleRLConfig:
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    class SimpleResidualPolicy(ResidualAgentAPI):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("rl_simple.py is missing; SIMPLE residual-control training is unavailable.")
+
+try:
+    from rl_sac import SACResidualPolicy, SACConfig
+except Exception:
+    class SACConfig:
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    class SACResidualPolicy(ResidualAgentAPI):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("rl_sac.py is missing; SAC residual-control training is unavailable.")
 
 
 def save_meta(name: str, meta: Dict):
@@ -910,6 +931,336 @@ def train_and_save(
     else:
         raise ValueError("agent_type must be 'simple' or 'sac'")
 
+
+# -------------------------
+# Trajectory-type reference generation (LQR / NN / RL)
+# -------------------------
+
+def _torch_import():
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception as exc:
+        raise RuntimeError(
+            "trj_type='NN' or trj_type='RL' needs PyTorch to load saved weights. "
+            f"Import failed: {exc}"
+        )
+    return torch, nn
+
+
+def _safe_trapz(y: np.ndarray, x: np.ndarray) -> float:
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if len(y) < 2:
+        return 0.0
+    return float(np.sum(0.5 * (y[:-1] + y[1:]) * np.diff(x)))
+
+
+def _safe_cumtrapz(y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    out = np.zeros_like(y, dtype=float)
+    if len(y) >= 2:
+        out[1:] = np.cumsum(0.5 * (y[:-1] + y[1:]) * np.diff(x))
+    return out
+
+
+def _minimum_jerk(z: np.ndarray) -> np.ndarray:
+    return 10.0 * z**3 - 15.0 * z**4 + 6.0 * z**5
+
+
+def _nn_case_input(theta_goal: float, alpha: float, phi: float) -> np.ndarray:
+    max_tilt = math.radians(20.0)
+    return np.array([theta_goal / math.pi, alpha / max_tilt, phi / max_tilt], dtype=np.float32)
+
+
+def _nn_shape_basis(z: np.ndarray, n_shape: int) -> np.ndarray:
+    return np.stack([np.sin(k * math.pi * z) for k in range(1, n_shape + 1)], axis=1)
+
+
+def _softplus_np(x: np.ndarray) -> np.ndarray:
+    return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
+
+
+def _build_nn_monotone_reference(
+    theta_goal: float,
+    params: np.ndarray,
+    dt: float,
+    n_shape: int = 5,
+    omega_ref_limit: float = 0.2,
+    min_duration: float = 0.5,
+    max_duration: float = 80.0,
+    theta0: float = 0.0,
+) -> Tuple[np.ndarray, float]:
+    """Same inference-time trajectory decoder as trajectory_rl_gps_addon.py."""
+    params = np.asarray(params, dtype=float).reshape(-1)
+    if params.size != n_shape + 1:
+        raise ValueError(f"NN params must have length {n_shape + 1}, got {params.size}")
+
+    delta = float(theta_goal - theta0)
+    if abs(delta) < 1e-12:
+        t = np.arange(0.0, min_duration + 0.5 * dt, dt)
+        return np.full_like(t, theta0, dtype=float), float(t[-1])
+
+    z_grid = np.linspace(0.0, 1.0, 1001)
+    B = _nn_shape_basis(z_grid, n_shape)
+    logits = B @ params[:n_shape]
+    endpoint_factor = z_grid * (1.0 - z_grid)
+    v_shape = endpoint_factor * np.exp(np.clip(logits, -5.0, 5.0)) + 1e-6
+    area = _safe_trapz(v_shape, z_grid)
+    v_norm = v_shape / max(area, 1e-12)
+    h_grid = _safe_cumtrapz(v_norm, z_grid)
+    h_grid /= max(h_grid[-1], 1e-12)
+
+    max_hprime = float(np.max(np.abs(v_norm)))
+    T_min_vel = abs(delta) * max_hprime / max(omega_ref_limit, 1e-12)
+    duration_slack = float(_softplus_np(np.array([params[-1]]))[0])
+    T = float(np.clip(T_min_vel + duration_slack, min_duration, max_duration))
+
+    N = max(1, int(round(T / dt)))
+    t = np.arange(N + 1, dtype=float) * dt
+    T = float(t[-1])
+    z = np.clip(t / max(T, 1e-12), 0.0, 1.0)
+    h = np.interp(z, z_grid, h_grid)
+    theta_ref = theta0 + delta * h
+    theta_ref[0] = theta0
+    theta_ref[-1] = theta_goal
+    return theta_ref, T
+
+
+def _load_nn_reference(theta_goal: float, alpha: float, phi: float, dt: float, nn_dir: str, theta0: float = 0.0) -> Tuple[np.ndarray, float]:
+    """Load trajectory_policy.pt without importing trajectory_rl_gps_addon.py."""
+    torch, nn = _torch_import()
+    path = os.path.join(nn_dir, "trajectory_policy.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"NN trajectory weights not found: {path}. Run trajectory_rl_gps_addon.py first, "
+            "or pass nn_dir pointing to a folder containing trajectory_policy.pt."
+        )
+
+    n_shape = 5
+    hidden_sizes = (64, 64)
+    net = nn.Sequential(
+        nn.Linear(3, hidden_sizes[0]), nn.Tanh(),
+        nn.Linear(hidden_sizes[0], hidden_sizes[1]), nn.Tanh(),
+        nn.Linear(hidden_sizes[1], n_shape + 1),
+    )
+    state = torch.load(path, map_location="cpu")
+    net.load_state_dict(state)
+    net.eval()
+    x = torch.as_tensor(_nn_case_input(theta_goal, alpha, phi), dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        params = net(x).squeeze(0).cpu().numpy().astype(float)
+    params[:-1] = np.clip(params[:-1], -4.0, 4.0)
+    params[-1] = np.clip(params[-1], -4.0, 12.0)
+    return _build_nn_monotone_reference(theta_goal, params, dt, n_shape=n_shape, theta0=theta0)
+
+
+def _lqr_guide_shape_for_rl(theta_ref: np.ndarray, theta_goal: float, n_grid: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    z_old = np.linspace(0.0, 1.0, len(theta_ref))
+    z_grid = np.linspace(0.0, 1.0, n_grid)
+    raw = np.asarray(theta_ref, dtype=float) - float(theta_ref[0])
+    scale = float(raw[-1]) if len(raw) else 0.0
+    if abs(theta_goal) < 1e-12 or abs(scale) < 1e-9:
+        h = _minimum_jerk(z_grid) if abs(theta_goal) >= 1e-12 else np.zeros_like(z_grid)
+    else:
+        h_old = np.maximum.accumulate(np.clip(raw / scale, 0.0, 1.0))
+        h_old[0] = 0.0
+        h_old[-1] = 1.0
+        h = np.interp(z_grid, z_old, h_old)
+        h = np.maximum.accumulate(np.clip(0.85 * h + 0.15 * _minimum_jerk(z_grid), 0.0, 1.0))
+        h[0] = 0.0
+        h[-1] = 1.0
+    v = np.maximum(np.gradient(h, z_grid), 1e-6)
+    cap = max(5.0, 3.0 * float(np.percentile(v, 95)))
+    v = np.minimum(v, cap)
+    v /= max(_safe_trapz(v, z_grid), 1e-12)
+    return z_grid, h, v
+
+
+def _rl_residual_basis(z: np.ndarray, n_basis: int) -> np.ndarray:
+    return np.stack([np.sin(k * math.pi * z) for k in range(1, n_basis + 1)], axis=1)
+
+
+def _decode_rl_duration(raw_duration: float, theta_goal: float, T_guide: float) -> float:
+    omega_ref_limit = 0.2
+    duration_margin = 1.05
+    max_duration_factor = 2.5
+    min_extra_duration = 5.0
+    duration_exp_scale = 0.35
+    delta = abs(theta_goal)
+    if delta < 1e-12:
+        return max(0.5, T_guide)
+    T_min = duration_margin * delta / omega_ref_limit
+    T_center = max(T_guide, T_min)
+    T_max = max(max_duration_factor * T_min, T_min + min_extra_duration, T_center)
+    return float(np.clip(T_center * math.exp(duration_exp_scale * float(raw_duration)), T_min, T_max))
+
+
+def _build_rl_guided_reference(
+    theta_goal: float,
+    params: np.ndarray,
+    base_theta_ref: np.ndarray,
+    T_base: float,
+    dt: float,
+    theta0: float = 0.0,
+) -> Tuple[np.ndarray, float]:
+    """Inference-time decoder used by the SAC-GPS actor: LQR guide + learned residual."""
+    params = np.asarray(params, dtype=float).reshape(-1)
+    n_basis = 6
+    z_grid_size = 1201
+    duration_margin = 1.05
+    omega_ref_limit = 0.2
+    if params.size != n_basis + 1:
+        raise ValueError(f"RL params must have length {n_basis + 1}, got {params.size}")
+    delta = float(theta_goal - theta0)
+    if abs(delta) < 1e-12:
+        T = max(0.5, T_base)
+        N = max(1, int(math.ceil(T / dt)))
+        return np.full(N + 1, theta0, dtype=float), N * dt
+
+    z, _, v_base = _lqr_guide_shape_for_rl(base_theta_ref, theta_goal, z_grid_size)
+    B = _rl_residual_basis(z, n_basis)
+    residual_log = np.clip(B @ params[:n_basis], -3.0, 3.0)
+    v_gps = np.maximum(v_base, 1e-8) * np.exp(residual_log)
+    v_gps = np.maximum(v_gps, 1e-9)
+    v_gps /= max(_safe_trapz(v_gps, z), 1e-12)
+
+    T = _decode_rl_duration(params[-1], theta_goal=theta_goal, T_guide=T_base)
+    shape_peak = float(np.max(v_gps))
+    T_needed = duration_margin * abs(delta) * shape_peak / omega_ref_limit
+    T = max(T, T_needed)
+    N = max(1, int(math.ceil(T / dt)))
+    T = N * dt
+
+    h_gps = _safe_cumtrapz(v_gps, z)
+    h_gps = h_gps / max(h_gps[-1], 1e-12)
+    h_gps = np.maximum.accumulate(np.clip(h_gps, 0.0, 1.0))
+    h_gps[0] = 0.0
+    h_gps[-1] = 1.0
+
+    t = np.arange(N + 1, dtype=float) * dt
+    h_time = np.interp(t / max(T, 1e-12), z, h_gps)
+    theta_ref = theta0 + delta * h_time
+    theta_ref[0] = theta0
+    theta_ref[-1] = theta_goal
+    return theta_ref, T
+
+
+def _load_rl_reference(theta_goal: float, alpha: float, phi: float, dt: float, rl_dir: str, theta0: float = 0.0) -> Tuple[np.ndarray, float]:
+    """Load SAC-GPS actor weights without importing sac_gps_lqr_guided_saved_teacher_addon.py."""
+    torch, nn = _torch_import()
+    checkpoint = os.path.join(rl_dir, "sac_gps_agent.pt")
+    actor_only = os.path.join(rl_dir, "sac_gps_actor.pt")
+    path = checkpoint if os.path.exists(checkpoint) else actor_only
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"RL actor weights not found in {rl_dir}. Expected sac_gps_agent.pt or sac_gps_actor.pt. "
+            "Run sac_gps_lqr_guided_saved_teacher_addon.py first."
+        )
+
+    obs_dim = 3
+    act_dim = 7
+    hidden_sizes = (128, 128)
+    net = nn.Sequential(
+        nn.Linear(obs_dim, hidden_sizes[0]), nn.ReLU(),
+        nn.Linear(hidden_sizes[0], hidden_sizes[1]), nn.ReLU(),
+        nn.Linear(hidden_sizes[1], 2 * act_dim),
+    )
+    ckpt = torch.load(path, map_location="cpu")
+    state = ckpt.get("actor", ckpt) if isinstance(ckpt, dict) else ckpt
+    # SAC actor stores the sequential network under the prefix 'net.net'.
+    if any(k.startswith("net.net.") for k in state.keys()):
+        translated = {k.replace("net.net.", "", 1): v for k, v in state.items() if k.startswith("net.net.")}
+    else:
+        translated = state
+    net.load_state_dict(translated)
+    net.eval()
+
+    obs = np.array([theta_goal / math.pi, alpha / math.radians(20.0), phi / math.radians(20.0)], dtype=np.float32)
+    x = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        mu_logstd = net(x)
+        mu, _ = torch.chunk(mu_logstd, 2, dim=-1)
+        action = torch.tanh(mu).squeeze(0).cpu().numpy().astype(np.float32)
+    scales = np.r_[np.ones(6) * 1.30, 1.20].astype(np.float32)
+    params = np.clip(action, -1.0, 1.0) * scales
+
+    # Build the LQR guide with this main file's nominal model, then apply the RL residual.
+    T_base = time_horizon(theta0, theta_goal)
+    N_base = max(1, int(round(T_base / dt)))
+    x0 = np.array([theta0, 0.0], dtype=float)
+    xg = np.array([theta_goal, 0.0], dtype=float)
+    # Use the same default LQR weights as the current rollout call through the public wrapper below.
+    raise RuntimeError("Internal error: _load_rl_reference must be called through build_trajectory_reference so lqr_w/nom/plant_p are available.")
+
+
+def build_trajectory_reference(
+    trj_type: str,
+    theta0: float,
+    theta_goal: float,
+    plant_p: PlantParams,
+    nom: NominalModel,
+    lqr_w: LQRWeights,
+    nn_dir: str = "trajectory_rl_results",
+    rl_dir: str = "true_gps_results_smoke",
+) -> Optional[Dict[str, object]]:
+    """Return a rollout_once reference dictionary for trj_type in {'LQR','NN','RL'}.
+
+    LQR returns None so rollout_once uses its original built-in LQR generator.
+    NN loads trajectory_policy.pt and decodes a learned monotone reference.
+    RL loads the saved SAC-GPS actor and decodes an LQR-guided residual reference.
+    No training is done here.
+    """
+    kind = str(trj_type).upper()
+    if kind == "LQR":
+        return None
+    if kind == "NN":
+        theta_ref, T = _load_nn_reference(theta_goal, plant_p.alpha, plant_p.phi, plant_p.dt, nn_dir, theta0=theta0)
+        return {"kind": "NN", "theta": theta_ref, "duration": T}
+    if kind == "RL":
+        # Reuse the actor-loading part, but build the LQR guide using the current main-file model.
+        torch, nn = _torch_import()
+        checkpoint = os.path.join(rl_dir, "sac_gps_agent.pt")
+        actor_only = os.path.join(rl_dir, "sac_gps_actor.pt")
+        path = checkpoint if os.path.exists(checkpoint) else actor_only
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"RL actor weights not found in {rl_dir}. Expected sac_gps_agent.pt or sac_gps_actor.pt."
+            )
+        obs_dim, act_dim, hidden_sizes = 3, 7, (128, 128)
+        net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_sizes[0]), nn.ReLU(),
+            nn.Linear(hidden_sizes[0], hidden_sizes[1]), nn.ReLU(),
+            nn.Linear(hidden_sizes[1], 2 * act_dim),
+        )
+        ckpt = torch.load(path, map_location="cpu")
+        state = ckpt.get("actor", ckpt) if isinstance(ckpt, dict) else ckpt
+        translated = {k.replace("net.net.", "", 1): v for k, v in state.items() if k.startswith("net.net.")} if any(k.startswith("net.net.") for k in state.keys()) else state
+        net.load_state_dict(translated)
+        net.eval()
+        obs = np.array([theta_goal / math.pi, plant_p.alpha / math.radians(20.0), plant_p.phi / math.radians(20.0)], dtype=np.float32)
+        with torch.no_grad():
+            mu_logstd = net(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
+            mu, _ = torch.chunk(mu_logstd, 2, dim=-1)
+            action = torch.tanh(mu).squeeze(0).cpu().numpy().astype(np.float32)
+        params = np.clip(action, -1.0, 1.0) * np.r_[np.ones(6) * 1.30, 1.20].astype(np.float32)
+
+        T_base = time_horizon(theta0, theta_goal)
+        N_base = max(1, int(round(T_base / plant_p.dt)))
+        x_ref, _ = generate_reference_ilqr_like(
+            nom, plant_p,
+            np.array([theta0, 0.0], dtype=float),
+            np.array([theta_goal, 0.0], dtype=float),
+            N=N_base,
+            dt=plant_p.dt,
+            w=lqr_w,
+        )
+        base_ref = np.concatenate([[theta0], x_ref[:-1, 0]])
+        theta_ref, T = _build_rl_guided_reference(theta_goal, params, base_ref, T_base, plant_p.dt, theta0=theta0)
+        return {"kind": "RL", "theta": theta_ref, "duration": T}
+    raise ValueError("trj_type must be one of 'LQR', 'NN', or 'RL'")
+
 # -------------------------
 # Evaluation / Rollout API as requested
 # -------------------------
@@ -924,7 +1275,10 @@ def evaluate_and_rollout(
     smc_cfg: SMCConfig,
     cost_cfg: CostConfig,
     reference: Optional[Dict[str, object]] = None,
-    seed: int = 123
+    seed: int = 123,
+    trj_type: str = "LQR",
+    nn_dir: str = "trajectory_rl_results",
+    rl_dir: str = "true_gps_results_smoke",
 ) -> Dict[str, np.ndarray]:
     """Simulate one rollout using a saved agent or pure TDE SMC.
 
@@ -959,12 +1313,27 @@ def evaluate_and_rollout(
         else:
             raise ValueError(f"Unknown agent type in meta: {a_type}")
 
+    # If the caller did not pass a custom reference, generate it from trj_type.
+    # For trj_type="LQR" this remains None, preserving the original behavior.
+    if reference is None:
+        reference = build_trajectory_reference(
+            trj_type=trj_type,
+            theta0=theta0,
+            theta_goal=theta_goal,
+            plant_p=plant_p,
+            nom=nom,
+            lqr_w=lqr_w,
+            nn_dir=nn_dir,
+            rl_dir=rl_dir,
+        )
+
     task = Task(theta0=theta0, omega0=0.0, theta_goal=theta_goal)
     plant = OneDOFRotorPlant(plant_p)
     metrics, logs = rollout_once(
         plant, nom, task, lqr_w, smc_cfg, agent, cost_cfg, reference=reference, seed=seed, collect_logs=True
     )
     logs['metrics'] = metrics
+    logs['trj_type'] = str(trj_type).upper() if reference is None else str(reference.get('kind', trj_type)).upper()
     return logs
 
 
@@ -1108,34 +1477,35 @@ def plot_rollout_and_errors(
 
 def default_params():
     plant_p = PlantParams(
-        J=0.045,
+        J=14099,
         b=0.09,
-        u_max=0.8,
+        u_max= 500,
         omega_max=8.0,
         dt=0.002,
-        tau_i=0.01,
-        K_t=1.0,
-        m1=2.0,
-        R1=0.10,
-        m2=0.5,
-        a2=0.01,
-        r1=0.07,
-        m3=0.8,
-        a3=0.015,
-        r2=0.08,
-        m4=0.4,
-        L4=0.20,
-        l4_c=0.10,
-        gamma=0.0,
-        beta2=0.0,
-        beta4=0.0,
-        alpha=math.radians(15.0),
-        phi=math.radians(10.0),
-        g=9.81,
-        subtract_gravity_in_ueq=False,
+        tau_i=0.1,
+        K_t=5.0,
+        m1 = 5000.0,     # [kg] Grey base mass (solid disk)
+        R1 = 3.10  ,  # [m] Grey base radius
+        m2  = 600.5,     # [kg] Blue post mass
+        a2  = 1.5  ,  # [m] Blue post local radius
+        r1  = .5   , # [m] Blue post radial offset from spin axis
+        m3  = 600.8,     # [kg] Orange post mass
+        a3  = 1.5  , # [m] Orange post local radius
+        r2  = 0.5  ,  # [m] Orange post radial offset from spin axis
+        m4  = 300.4,     # [kg] Red link mass (slender bar)
+        L4  = 1.20 ,   # [m] Red link length
+        l4_c  = 0.60,  # [m] Red link COM distance from hinge along the link
+        gamma  = 0.0,  # [rad] Red link COM azimuth w.r.t orange post
+        beta2  = 0.0,  # [rad] Blue post COM azimuth about spin axis
+        beta4  = 0.0,  # [rad] Red link COM azimuth about spin axis
+        alpha  = math.radians(25.0),  # [rad] Platform roll tilt
+        phi  = math.radians(3.0)  ,  # [rad] Platform pitch tilt
+        g  = 9.81                 ,  # [m/s²] Gravity magnitude
+        subtract_gravity_in_ueq = False  # Gravity handled by TDE when False
+
     )
     
-    nom = NominalModel(J=0.05, b=0.06)
+    nom = NominalModel(J=13000, b=0.06)
     lqr_w = LQRWeights(q_theta=85.0, q_omega=18.0, r_u=0.02, qT_theta=4200.0, qT_omega=220.0)
     smc_cfg = SMCConfig(lambda_s=35.0, k=0.85, phi=0.025)
     cost_cfg = CostConfig(w_e=8.0, w_edot=1.0, w_u=0.03, w_omega=0.3, goal_tol=1e-2, done_bonus=2.0)
@@ -1149,8 +1519,8 @@ if __name__ == "__main__":
 
     plant_p, nom, lqr_w, smc_cfg, cost_cfg = default_params()
     theta0 = 0.0
-    theta_goal = math.radians(90.0)
-    demo_duration = 1.2
+    theta_goal = math.radians(-90.0)
+    demo_duration = 150.2
 
     logs_demo = evaluate_and_rollout(
         agent_name="none",
