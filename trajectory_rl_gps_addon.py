@@ -333,7 +333,7 @@ def cem_optimize_case(
         std = np.maximum(std, 0.03)
         print("base_metrics keys:", base_metrics.keys())
         print("base_metrics:", base_metrics)
-        history.append(dict(iteration=it, best=float(best["cost"]), baseline=float(base_metrics["total"])))
+        history.append(dict(iteration=it, best=float(best["cost"]), baseline=float(base_metrics["total_cost"])))
         if verbose:
             print(f"CEM {case.label()} iter={it:02d}: best={best['cost']:.5g}, baseline={base_metrics['total']:.5g}")
 
