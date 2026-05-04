@@ -260,6 +260,10 @@ def simulate_reference(case: GPSCase, theta_ref: np.ndarray, T: float, seed: int
 
 
 def compute_objective(logs: Dict[str, np.ndarray], case: GPSCase, obj: GPSObjectiveConfig, guide_theta_ref: Optional[np.ndarray] = None, guide_T: Optional[float] = None) -> Dict[str, float]:
+    required_keys = ("t", "theta", "theta_ref", "omega", "omega_ref", "u_total")
+    missing = [k for k in required_keys if k not in logs]
+    if missing:
+        raise KeyError(f"compute_objective missing required log keys: {missing}")
     t = np.asarray(logs["t"], dtype=float)
     dt = float(np.mean(np.diff(t))) if len(t) > 1 else float(sysmod.DT)
     theta = np.asarray(logs["theta"], dtype=float)
@@ -311,7 +315,7 @@ def compute_objective(logs: Dict[str, np.ndarray], case: GPSCase, obj: GPSObject
         + obj.w_duration * duration
     )
     return dict(
-        total=float(total), energy=energy, theta_track=theta_track, omega_track=omega_track,
+        total_cost=float(total), energy=energy, theta_track=theta_track, omega_track=omega_track,
         final_theta_error=abs(final_theta_error), final_omega_abs=abs(final_omega),
         max_abs_omega=float(np.max(np.abs(omega))) if len(omega) else 0.0,
         max_abs_omega_ref=float(np.max(np.abs(omega_ref))) if len(omega_ref) else 0.0,
@@ -371,7 +375,7 @@ def cem_optimize_guided_case(
         for j, p in enumerate(candidates):
             try:
                 metrics, logs, theta_ref, T, extra, _, _ = evaluate_guided_params(case, p, traj_cfg, obj_cfg, seed=seed + 1000 * it + j)
-                cost = metrics["total"]
+                cost = metrics["total_cost"]
             except Exception:
                 metrics, logs, theta_ref, T, extra = None, None, None, None, None
                 cost = np.inf
@@ -489,9 +493,9 @@ def plot_evaluation_summary(rows: Sequence[Dict[str, object]], save_dir: Optiona
     if not rows: return
     labels = [f"{r['case'].theta_goal_deg:.0f}\n{r['case'].alpha_deg:.0f}/{r['case'].phi_deg:.0f}" for r in rows]
     x = np.arange(len(rows)); width = 0.25
-    c_existing = np.array([r["existing_metrics"]["total"] for r in rows])
-    c_nn = np.array([r["nn_metrics"]["total"] for r in rows])
-    c_gps = np.array([r["gps_metrics"]["total"] for r in rows])
+    c_existing = np.array([r["existing_metrics"]["total_cost"] for r in rows])
+    c_nn = np.array([r["nn_metrics"]["total_cost"] for r in rows])
+    c_gps = np.array([r["gps_metrics"]["total_cost"] for r in rows])
     fig = plt.figure(figsize=(max(10, len(rows) * 0.55), 5))
     plt.bar(x - width, c_existing, width, label="LQR")
     plt.bar(x, c_nn, width, label="policy")
@@ -505,7 +509,7 @@ def save_evaluation_table(rows: Sequence[Dict[str, object]], save_dir: str):
     table = []
     for r in rows:
         c = r["case"]
-        table.append(dict(theta_goal_deg=c.theta_goal_deg, alpha_deg=c.alpha_deg, phi_deg=c.phi_deg, existing_cost=r["existing_metrics"]["total"], nn_cost=r["nn_metrics"]["total"], gps_cost=r["gps_metrics"]["total"]))
+        table.append(dict(theta_goal_deg=c.theta_goal_deg, alpha_deg=c.alpha_deg, phi_deg=c.phi_deg, existing_cost=r["existing_metrics"]["total_cost"], nn_cost=r["nn_metrics"]["total_cost"], gps_cost=r["gps_metrics"]["total_cost"]))
     with open(os.path.join(save_dir, "true_gps_evaluation_summary.json"), "w") as f:
         json.dump(table, f, indent=2)
 
