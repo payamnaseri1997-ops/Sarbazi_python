@@ -445,20 +445,72 @@ def policy_predict_params(policy: GuidedTrajectoryPolicy, case: GPSCase) -> np.n
         return policy(x).squeeze(0).cpu().numpy().astype(float)
 
 
-def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajectoryConfig, obj_cfg: GPSObjectiveConfig, cem_iters: int = 10, population: int = 48, elite_frac: float = 0.20, policy_epochs: int = 1500, seed: int = 0, save_dir: Optional[str] = None):
+
+def _model_path(save_dir: str, filename: str) -> str:
+    return os.path.join(save_dir, filename)
+
+
+def _case_key(case: GPSCase) -> str:
+    return f"{case.theta_goal_deg:.6f}|{case.alpha_deg:.6f}|{case.phi_deg:.6f}"
+
+
+def _case_to_dict(case: GPSCase) -> Dict[str, float]:
+    return {"theta_goal_deg": float(case.theta_goal_deg), "alpha_deg": float(case.alpha_deg), "phi_deg": float(case.phi_deg)}
+
+
+def _load_training_history(save_dir: str) -> List[Dict[str, object]]:
+    path = _model_path(save_dir, "training_history.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajectoryConfig, obj_cfg: GPSObjectiveConfig, cem_iters: int = 10, population: int = 48, elite_frac: float = 0.20, policy_epochs: int = 1500, seed: int = 0, save_dir: Optional[str] = None, resume_training: bool = False, skip_existing_cases: bool = False):
     mkdir(save_dir)
+    timestamp = str(np.datetime64("now"))
+    model_path = _model_path(save_dir or ".", "true_gps_policy.pt")
+    teachers_path = _model_path(save_dir or ".", "training_teachers.json")
+    if resume_training:
+        if os.path.exists(model_path):
+            print(f"Resuming training from: {model_path}")
+        else:
+            raise FileNotFoundError(f"resume_training=True but no saved model found at: {model_path}")
+    else:
+        print("Starting training from scratch")
+    prior_keys = set()
+    if os.path.exists(teachers_path):
+        with open(teachers_path, "r") as f:
+            for r in json.load(f):
+                prior_keys.add(f"{float(r['theta_goal_deg']):.6f}|{float(r['alpha_deg']):.6f}|{float(r['phi_deg']):.6f}")
+    selected_cases, skipped_cases = [], []
+    for c in train_cases:
+        (skipped_cases if skip_existing_cases and _case_key(c) in prior_keys else selected_cases).append(c)
     local_results = []
-    for i, case in enumerate(train_cases):
-        print(f"\n=== Local GPS teacher {i+1}/{len(train_cases)}: {case.label()} ===")
+    for i, case in enumerate(selected_cases):
+        print(f"\n=== Local GPS teacher {i+1}/{len(selected_cases)}: {case.label()} ===")
         res = cem_optimize_guided_case(case, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=elite_frac, seed=seed + 100 * i)
         local_results.append(res)
-    policy, losses = train_policy_from_local_teachers(local_results, traj_cfg, epochs=policy_epochs, seed=seed)
+    policy = GuidedTrajectoryPolicy(traj_cfg)
+    if resume_training:
+        policy.load_state_dict(torch.load(model_path, map_location="cpu"))
+    if local_results:
+        policy, losses = train_policy_from_local_teachers(local_results, traj_cfg, epochs=policy_epochs, seed=seed)
+    else:
+        losses = []
     if save_dir:
-        # Keep saved model names/formats unchanged.
-        torch.save(policy.state_dict(), os.path.join(save_dir, "true_gps_policy.pt"))
-        with open(os.path.join(save_dir, "training_teachers.json"), "w") as f:
+        torch.save(policy.state_dict(), model_path)
+        print(f"Saved model to: {model_path}")
+        with open(teachers_path, "w") as f:
             json.dump([dict(theta_goal_deg=r["case"].theta_goal_deg, alpha_deg=r["case"].alpha_deg, phi_deg=r["case"].phi_deg, best_cost=r["best"]["cost"], best_params=np.asarray(r["best"]["params"]).tolist()) for r in local_results], f, indent=2)
-    return dict(policy=policy, losses=losses, local_results=local_results)
+        run_record = dict(timestamp=timestamp, resume_training=bool(resume_training), skip_existing_cases=bool(skip_existing_cases), cem_iters=int(cem_iters), population=int(population), policy_epochs=int(policy_epochs), model_path=model_path, trained_cases_this_run=[_case_to_dict(c) for c in selected_cases], skipped_cases=[_case_to_dict(c) for c in skipped_cases])
+        hist = _load_training_history(save_dir); hist.append(run_record)
+        with open(_model_path(save_dir, "training_history.json"), "w") as f:
+            json.dump(hist, f, indent=2)
+        latest_path = _model_path(save_dir, "latest_run_config.json")
+        with open(latest_path, "w") as f:
+            json.dump(run_record, f, indent=2)
+        print(f"Saved training metadata to: {latest_path}")
+    return dict(policy=policy, losses=losses, local_results=local_results, train_cases=selected_cases, skipped_cases=skipped_cases)
 
 
 def evaluate_true_gps_policy(policy: GuidedTrajectoryPolicy, test_cases: Sequence[GPSCase], traj_cfg: GPSTrajectoryConfig, obj_cfg: GPSObjectiveConfig, refinement_iters: int = 4, refinement_population: int = 24, seed: int = 1000):
@@ -526,11 +578,13 @@ def run_true_gps_experiment(
     refinement_population: int = 24,
     save_dir: str = "true_gps_results",
     show_plots: bool = True,
+    resume_training: bool = False,
+    skip_existing_cases: bool = False,
 ):
     mkdir(save_dir)
     traj_cfg, obj_cfg = make_default_configs()
     train_cases = make_cases(train_goal_degs, tilt_degs, coupled_tilts=coupled_tilts)
-    train_output = train_true_gps_policy(train_cases, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=0.20, policy_epochs=policy_epochs, seed=1, save_dir=save_dir)
+    train_output = train_true_gps_policy(train_cases, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=0.20, policy_epochs=policy_epochs, seed=1, save_dir=save_dir, resume_training=resume_training, skip_existing_cases=skip_existing_cases)
     test_cases = make_cases(test_goal_degs, tilt_degs, coupled_tilts=coupled_tilts)
     rows = evaluate_true_gps_policy(train_output["policy"], test_cases, traj_cfg, obj_cfg, refinement_iters=refinement_iters, refinement_population=refinement_population, seed=1000)
     plot_training_diagnostics(train_output, save_dir=save_dir, show=show_plots)
@@ -553,4 +607,6 @@ if __name__ == "__main__":
         refinement_population=10,
         save_dir="true_gps_results_smoke",
         show_plots=True,
+        resume_training=False,
     )
+    # Example resume: set resume_training=True to continue from true_gps_policy.pt.

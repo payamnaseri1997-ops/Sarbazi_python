@@ -394,6 +394,35 @@ def policy_params(policy: TrajectoryPolicyNet, case: CaseSpec) -> np.ndarray:
     return p.astype(float)
 
 
+
+def _model_path(save_dir: str, filename: str) -> str:
+    return os.path.join(save_dir, filename)
+
+
+def _case_key(case: CaseSpec) -> str:
+    return f"{case.theta_goal_deg:.6f}|{case.alpha_deg:.6f}|{case.phi_deg:.6f}"
+
+
+def _case_to_dict(case: CaseSpec) -> Dict[str, float]:
+    return {"theta_goal_deg": float(case.theta_goal_deg), "alpha_deg": float(case.alpha_deg), "phi_deg": float(case.phi_deg)}
+
+
+def _load_training_history(save_dir: str) -> List[Dict[str, object]]:
+    path = _model_path(save_dir, "training_history.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _save_training_history(save_dir: str, run_record: Dict[str, object]) -> str:
+    path = _model_path(save_dir, "training_history.json")
+    history = _load_training_history(save_dir)
+    history.append(run_record)
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+    return path
+
 def train_gps_trajectory_policy(
     train_cases: Sequence[CaseSpec],
     traj_cfg: Optional[TrajectoryPolicyConfig] = None,
@@ -404,6 +433,8 @@ def train_gps_trajectory_policy(
     policy_epochs: int = 1500,
     seed: int = 1,
     save_dir: str = "trajectory_rl_results",
+    resume_training: bool = False,
+    skip_existing_cases: bool = False,
 ) -> Dict[str, object]:
     if traj_cfg is None or obj_cfg is None:
         default_traj, default_obj = make_default_configs()
@@ -411,22 +442,56 @@ def train_gps_trajectory_policy(
         obj_cfg = default_obj if obj_cfg is None else obj_cfg
     os.makedirs(save_dir, exist_ok=True)
 
+    timestamp = str(np.datetime64("now"))
+    model_path = _model_path(save_dir, "trajectory_policy.pt")
+    teachers_path = _model_path(save_dir, "training_cases.json")
+    if resume_training:
+        if os.path.exists(model_path):
+            print(f"Resuming training from: {model_path}")
+        else:
+            raise FileNotFoundError(f"resume_training=True but no saved model found at: {model_path}")
+    else:
+        print("Starting training from scratch")
+
+    prior_case_keys = set()
+    if os.path.exists(teachers_path):
+        with open(teachers_path, "r") as f:
+            for row in json.load(f):
+                prior_case_keys.add(f"{float(row['theta_goal_deg']):.6f}|{float(row['alpha_deg']):.6f}|{float(row['phi_deg']):.6f}")
+
+    selected_cases = []
+    skipped_cases = []
+    for c in train_cases:
+        if skip_existing_cases and _case_key(c) in prior_case_keys:
+            skipped_cases.append(c)
+        else:
+            selected_cases.append(c)
+
     local_results = []
     params_list = []
-    for idx, case in enumerate(train_cases):
+    for idx, case in enumerate(selected_cases):
         result = cem_optimize_case(case, traj_cfg, obj_cfg, n_iter=cem_iters, population=population, elite_frac=elite_frac, seed=seed + 100 * idx, verbose=True)
         local_results.append(result)
         params_list.append(result["params"])
 
     policy = TrajectoryPolicyNet(traj_cfg)
-    losses = fit_policy_to_local_solutions(policy, train_cases, params_list, epochs=policy_epochs, lr=2e-3)
+    if resume_training:
+        policy.load_state_dict(torch.load(model_path, map_location="cpu"))
+    losses = fit_policy_to_local_solutions(policy, selected_cases, params_list, epochs=policy_epochs, lr=2e-3) if selected_cases else []
 
-    # Keep saved model name/format unchanged.
-    torch.save(policy.state_dict(), os.path.join(save_dir, "trajectory_policy.pt"))
-    with open(os.path.join(save_dir, "training_cases.json"), "w") as f:
-        json.dump([{"theta_goal_deg": c.theta_goal_deg, "alpha_deg": c.alpha_deg, "phi_deg": c.phi_deg} for c in train_cases], f, indent=2)
+    torch.save(policy.state_dict(), model_path)
+    print(f"Saved model to: {model_path}")
+    with open(teachers_path, "w") as f:
+        json.dump([_case_to_dict(c) for c in train_cases], f, indent=2)
 
-    return dict(policy=policy, traj_cfg=traj_cfg, obj_cfg=obj_cfg, local_results=local_results, policy_losses=losses, train_cases=list(train_cases), save_dir=save_dir)
+    run_record = dict(timestamp=timestamp, resume_training=bool(resume_training), skip_existing_cases=bool(skip_existing_cases), cem_iters=int(cem_iters), population=int(population), policy_epochs=int(policy_epochs), model_path=model_path, trained_cases_this_run=[_case_to_dict(c) for c in selected_cases], skipped_cases=[_case_to_dict(c) for c in skipped_cases])
+    history_path = _save_training_history(save_dir, run_record)
+    latest_path = _model_path(save_dir, "latest_run_config.json")
+    with open(latest_path, "w") as f:
+        json.dump(run_record, f, indent=2)
+    print(f"Saved training metadata to: {latest_path}")
+
+    return dict(policy=policy, traj_cfg=traj_cfg, obj_cfg=obj_cfg, local_results=local_results, policy_losses=losses, train_cases=list(selected_cases), skipped_cases=skipped_cases, save_dir=save_dir, history_path=history_path)
 
 
 def evaluate_policy_vs_existing(policy: TrajectoryPolicyNet, cases: Sequence[CaseSpec], traj_cfg: TrajectoryPolicyConfig, obj_cfg: TrajectoryConstraintConfig, seed: int = 123):
@@ -491,10 +556,12 @@ def run_full_trajectory_rl_experiment(
     policy_epochs: int = 1000,
     save_dir: str = "trajectory_rl_results",
     show_plots: bool = True,
+    resume_training: bool = False,
+    skip_existing_cases: bool = False,
 ):
     traj_cfg, obj_cfg = make_default_configs()
     train_cases = make_cases(train_goal_degs, tilt_degs, coupled_tilt=True)
-    train_output = train_gps_trajectory_policy(train_cases, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=0.20, policy_epochs=policy_epochs, seed=1, save_dir=save_dir)
+    train_output = train_gps_trajectory_policy(train_cases, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=0.20, policy_epochs=policy_epochs, seed=1, save_dir=save_dir, resume_training=resume_training, skip_existing_cases=skip_existing_cases)
     test_cases = make_cases(test_goal_degs, tilt_degs, coupled_tilt=True)
     rows = evaluate_policy_vs_existing(train_output["policy"], test_cases, traj_cfg, obj_cfg, seed=1000)
     plot_training_progress(train_output, save_dir=save_dir, show=show_plots)
@@ -512,4 +579,6 @@ if __name__ == "__main__":
         policy_epochs=300,
         save_dir="trajectory_rl_results_smoke",
         show_plots=True,
+        resume_training=False,
     )
+    # To continue training from saved weights, set resume_training=True.
