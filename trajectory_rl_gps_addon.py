@@ -347,7 +347,7 @@ def cem_optimize_case(
 
 #%% ========================= DEEP TRAJECTORY POLICY =========================
 
-class TrajectoryPolicyNet(nn.Module):
+class TrajectoryPolicyNet(nn.Module if nn is not None else object):
     def __init__(self, cfg: TrajectoryPolicyConfig):
         if torch is None:
             raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
