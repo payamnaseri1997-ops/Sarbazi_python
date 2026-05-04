@@ -452,7 +452,15 @@ def _load_history_if_available(save_dir: Optional[str]) -> List[Dict[str, float]
     return hist
 
 
-def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=1000, teacher_cem_iters=4, teacher_population=20, eval_every=50, seed=0, save_dir=None, use_saved_teacher_summary=True, allow_fresh_cem_teachers=False, load_existing_agent=True, skip_training_if_agent_loaded=True):
+def _case_key(case: gps.GPSCase) -> str:
+    return f"{case.theta_goal_deg:.6f}|{case.alpha_deg:.6f}|{case.phi_deg:.6f}"
+
+
+def _case_to_dict(case: gps.GPSCase) -> Dict[str, float]:
+    return {"theta_goal_deg": float(case.theta_goal_deg), "alpha_deg": float(case.alpha_deg), "phi_deg": float(case.phi_deg)}
+
+
+def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=1000, teacher_cem_iters=4, teacher_population=20, eval_every=50, seed=0, save_dir=None, use_saved_teacher_summary=True, allow_fresh_cem_teachers=False, resume_training=False, skip_existing_cases=False):
     if torch is None:
         raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
     mkdir(save_dir)
@@ -465,16 +473,21 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
     checkpoint_path = os.path.join(save_dir, "sac_gps_agent.pt") if save_dir else "sac_gps_agent.pt"
     agent_loaded = False
 
-    if load_existing_agent and os.path.exists(checkpoint_path):
-        agent.load(checkpoint_path); agent_loaded = True
-    if agent_loaded and skip_training_if_agent_loaded:
-        print("Existing SAC-GPS checkpoint loaded. Skipping training and using saved agent for evaluation.")
-        if save_dir:
-            actor_path = os.path.join(save_dir, "sac_gps_actor.pt")
-            if not os.path.exists(actor_path):
-                torch.save(agent.actor.state_dict(), actor_path)
-                print(f"Exported actor-only checkpoint to: {actor_path}")
-        return dict(agent=agent, history=history, teacher_output=None, baseline_cache=baseline_cache, agent_loaded=True)
+    if resume_training:
+        if os.path.exists(checkpoint_path):
+            agent.load(checkpoint_path); agent_loaded = True
+            print(f"Resuming training from: {checkpoint_path}")
+        else:
+            raise FileNotFoundError(f"resume_training=True but no saved model found at: {checkpoint_path}")
+    else:
+        print("Starting training from scratch")
+
+    if skip_existing_cases and history:
+        seen = set()
+        for rec in history:
+            for c in rec.get("trained_cases_this_run", []):
+                seen.add(f"{float(c['theta_goal_deg']):.6f}|{float(c['alpha_deg']):.6f}|{float(c['phi_deg']):.6f}")
+        train_cases = [c for c in train_cases if _case_key(c) not in seen]
 
     if sac_cfg.use_teacher_prefill:
         if use_saved_teacher_summary:
@@ -515,6 +528,26 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
             json.dump(history, f, indent=2)
         with open(os.path.join(save_dir, "configs.json"), "w") as f:
             json.dump(dict(sac_cfg=asdict(sac_cfg), traj_cfg=asdict(traj_cfg), obj_cfg=asdict(obj_cfg)), f, indent=2)
+        run_record = dict(
+            timestamp=str(np.datetime64("now")),
+            resume_training=bool(resume_training),
+            skip_existing_cases=bool(skip_existing_cases),
+            total_interactions=int(total_interactions),
+            teacher_cem_iters=int(teacher_cem_iters),
+            teacher_population=int(teacher_population),
+            eval_every=int(eval_every),
+            model_path=agent_path,
+            trained_cases_this_run=[_case_to_dict(c) for c in train_cases],
+        )
+        latest_path = os.path.join(save_dir, "latest_run_config.json")
+        with open(latest_path, "w") as f:
+            json.dump(run_record, f, indent=2)
+        history_records = _load_history_if_available(save_dir)
+        history_records.append(run_record)
+        with open(os.path.join(save_dir, "training_history.json"), "w") as f:
+            json.dump(history_records, f, indent=2)
+        print(f"Saved model to: {agent_path}")
+        print(f"Saved training metadata to: {latest_path}")
     return dict(agent=agent, history=history, teacher_output=teacher_output, baseline_cache=baseline_cache, agent_loaded=agent_loaded)
 
 
@@ -583,8 +616,8 @@ if __name__ == "__main__":
     save_dir = "true_gps_results_smoke"
     show_plots = True
     seed = 0
-    load_existing_agent_if_available = True
-    skip_training_if_agent_loaded = True
+    resume_training = False
+    skip_existing_cases = False
     use_saved_teacher_summary = True
     allow_fresh_cem_teachers = False
     total_interactions = 1000
@@ -602,7 +635,7 @@ if __name__ == "__main__":
     print("TDE+SMC controller and plant dynamics are from LQR_TrjOPt_TDESMCwithRLresidual.py.")
     print(f"save_dir = {save_dir}")
 
-    train_output = train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=total_interactions, teacher_cem_iters=teacher_cem_iters, teacher_population=teacher_population, eval_every=eval_every, seed=seed, save_dir=save_dir, use_saved_teacher_summary=use_saved_teacher_summary, allow_fresh_cem_teachers=allow_fresh_cem_teachers, load_existing_agent=load_existing_agent_if_available, skip_training_if_agent_loaded=skip_training_if_agent_loaded)
+    train_output = train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=total_interactions, teacher_cem_iters=teacher_cem_iters, teacher_population=teacher_population, eval_every=eval_every, seed=seed, save_dir=save_dir, use_saved_teacher_summary=use_saved_teacher_summary, allow_fresh_cem_teachers=allow_fresh_cem_teachers, resume_training=resume_training, skip_existing_cases=skip_existing_cases)
     agent = train_output["agent"]
     baseline_cache = train_output["baseline_cache"]
     rows = evaluate_sac_gps_policy(agent, test_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache=baseline_cache, seed=seed + 200000, critic_refine=True)
@@ -619,3 +652,4 @@ if __name__ == "__main__":
     results = dict(agent=agent, train_output=train_output, eval_rows=rows, train_cases=train_cases, test_cases=test_cases, traj_cfg=traj_cfg, obj_cfg=obj_cfg, sac_cfg=sac_cfg, save_dir=save_dir)
     print("\nDone. Results are stored in variable: results")
     print(f"Saved outputs to: {save_dir}")
+    # Example resume: set resume_training=True to continue from sac_gps_agent.pt.
