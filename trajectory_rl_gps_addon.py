@@ -226,9 +226,13 @@ def simulate_existing_reference(case: CaseSpec, seed: int = 0, theta0: float = 0
 
 
 def trajectory_objective(logs: Dict[str, np.ndarray], theta_goal: float, plant_p, obj_cfg: TrajectoryConstraintConfig) -> Dict[str, float]:
+    required_keys = ("t", "theta", "theta_ref", "omega", "omega_ref", "u_total")
+    missing = [k for k in required_keys if k not in logs]
+    if missing:
+        raise KeyError(f"trajectory_objective missing required log keys: {missing}")
     t = np.asarray(logs["t"], dtype=float)
     if t.size == 0:
-        return {"total": 1e12}
+        return {"total_cost": 1e12}
     dt = float(plant_p.dt)
     theta = np.asarray(logs["theta"], dtype=float)
     theta_ref = np.asarray(logs["theta_ref"], dtype=float)
@@ -264,7 +268,7 @@ def trajectory_objective(logs: Dict[str, np.ndarray], theta_goal: float, plant_p
         + obj_cfg.w_duration * duration
     )
     return dict(
-        total=float(total), energy=energy, track=track, vel_track=vel_track, final=final,
+        total_cost=float(total), energy=energy, track=track, vel_track=vel_track, final=final,
         final_theta_error=final_theta_error, final_omega=final_omega,
         ref_vel_violation=ref_vel_violation, actual_vel_violation=actual_vel_violation,
         torque_violation=torque_violation, command_violation=command_violation, duration=duration,
@@ -319,7 +323,7 @@ def cem_optimize_case(
         eval_cache = []
         for i, p in enumerate(samples):
             metrics, logs, theta_ref, T = evaluate_params_for_case(case, p, traj_cfg, obj_cfg, seed=seed + i)
-            costs[i] = metrics["total"]
+            costs[i] = metrics["total_cost"]
             eval_cache.append((metrics, logs, theta_ref, T))
 
         order = np.argsort(costs)
@@ -331,11 +335,9 @@ def cem_optimize_case(
         mean = 0.35 * mean + 0.65 * elites.mean(axis=0)
         std = 0.35 * std + 0.65 * (elites.std(axis=0) + 1e-3)
         std = np.maximum(std, 0.03)
-        print("base_metrics keys:", base_metrics.keys())
-        print("base_metrics:", base_metrics)
         history.append(dict(iteration=it, best=float(best["cost"]), baseline=float(base_metrics["total_cost"])))
         if verbose:
-            print(f"CEM {case.label()} iter={it:02d}: best={best['cost']:.5g}, baseline={base_metrics['total']:.5g}")
+            print(f"CEM {case.label()} iter={it:02d}: best={best['cost']:.5g}, baseline={base_metrics['total_cost']:.5g}")
 
     best["history"] = history
     best["baseline_metrics"] = base_metrics
@@ -434,8 +436,8 @@ def evaluate_policy_vs_existing(policy: TrajectoryPolicyNet, cases: Sequence[Cas
         base_metrics = trajectory_objective(base_logs, case.theta_goal, plant_p, obj_cfg)
         p = policy_params(policy, case)
         rl_metrics, rl_logs, rl_theta_ref, rl_T = evaluate_params_for_case(case, p, traj_cfg, obj_cfg, seed=seed + i)
-        rows.append(dict(case=case, existing_metrics=base_metrics, rl_metrics=rl_metrics, existing_logs=base_logs, rl_logs=rl_logs, existing_theta_ref=base_theta_ref, rl_theta_ref=rl_theta_ref, existing_duration=base_T, rl_duration=rl_T, rl_params=p, improvement=base_metrics["total"] - rl_metrics["total"], improvement_ratio=(base_metrics["total"] - rl_metrics["total"]) / max(abs(base_metrics["total"]), 1e-12)))
-        print(f"Eval {case.label()}: existing={base_metrics['total']:.5g}, NN-traj={rl_metrics['total']:.5g}, improvement={rows[-1]['improvement_ratio'] * 100:.1f}%")
+        rows.append(dict(case=case, existing_metrics=base_metrics, rl_metrics=rl_metrics, existing_logs=base_logs, rl_logs=rl_logs, existing_theta_ref=base_theta_ref, rl_theta_ref=rl_theta_ref, existing_duration=base_T, rl_duration=rl_T, rl_params=p, improvement=base_metrics["total_cost"] - rl_metrics["total_cost"], improvement_ratio=(base_metrics["total_cost"] - rl_metrics["total_cost"]) / max(abs(base_metrics["total_cost"]), 1e-12)))
+        print(f"Eval {case.label()}: existing={base_metrics['total_cost']:.5g}, NN-traj={rl_metrics['total_cost']:.5g}, improvement={rows[-1]['improvement_ratio'] * 100:.1f}%")
     return rows
 
 
@@ -467,8 +469,8 @@ def plot_evaluation_summary(rows: Sequence[Dict[str, object]], save_dir: Optiona
         return
     labels = [f"{r['case'].theta_goal_deg:.0f}\n{r['case'].alpha_deg:.0f}/{r['case'].phi_deg:.0f}" for r in rows]
     x = np.arange(len(rows))
-    existing = np.array([r["existing_metrics"]["total"] for r in rows], dtype=float)
-    learned = np.array([r["rl_metrics"]["total"] for r in rows], dtype=float)
+    existing = np.array([r["existing_metrics"]["total_cost"] for r in rows], dtype=float)
+    learned = np.array([r["rl_metrics"]["total_cost"] for r in rows], dtype=float)
     fig = plt.figure(figsize=(max(10, len(rows) * 0.55), 5))
     width = 0.4
     plt.bar(x - width/2, existing, width, label="LQR reference")
@@ -498,7 +500,7 @@ def run_full_trajectory_rl_experiment(
     plot_training_progress(train_output, save_dir=save_dir, show=show_plots)
     plot_evaluation_summary(rows, save_dir=save_dir, show=show_plots)
     with open(os.path.join(save_dir, "evaluation_summary.json"), "w") as f:
-        json.dump([dict(theta_goal_deg=r["case"].theta_goal_deg, alpha_deg=r["case"].alpha_deg, phi_deg=r["case"].phi_deg, existing_cost=r["existing_metrics"]["total"], rl_cost=r["rl_metrics"]["total"], improvement_ratio=r["improvement_ratio"]) for r in rows], f, indent=2)
+        json.dump([dict(theta_goal_deg=r["case"].theta_goal_deg, alpha_deg=r["case"].alpha_deg, phi_deg=r["case"].phi_deg, existing_cost=r["existing_metrics"]["total_cost"], rl_cost=r["rl_metrics"]["total_cost"], improvement_ratio=r["improvement_ratio"]) for r in rows], f, indent=2)
     return dict(train_output=train_output, evaluation_rows=rows, traj_cfg=traj_cfg, obj_cfg=obj_cfg)
 
 

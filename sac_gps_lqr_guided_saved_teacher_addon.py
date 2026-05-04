@@ -328,15 +328,15 @@ def evaluate_action(case, action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, se
     existing_metrics, existing_logs, existing_ref, existing_T = baseline_cache.get(case, seed=seed)
     try:
         metrics, logs, theta_ref, T, extra, base_ref, base_T = gps.evaluate_guided_params(case, params, traj_cfg, obj_cfg, seed=seed)
-        cost = float(metrics["total"])
+        cost = float(metrics["total_cost"])
         failed = False
     except Exception:
         metrics, logs, theta_ref, T, extra, base_ref, base_T = None, None, None, None, None, existing_ref, existing_T
-        cost = float(existing_metrics["total"] + 1e8)
+        cost = float(existing_metrics["total_cost"] + 1e8)
         failed = True
-    raw_reward = (float(existing_metrics["total"]) - cost) / max(sac_cfg.reward_scale, 1e-12)
+    raw_reward = (float(existing_metrics["total_cost"]) - cost) / max(sac_cfg.reward_scale, 1e-12)
     reward = float(np.clip(raw_reward, -sac_cfg.reward_clip, sac_cfg.reward_clip))
-    return dict(case=case, action=np.asarray(action, dtype=np.float32), params=params, reward=reward, raw_reward=float(raw_reward), cost=cost, existing_cost=float(existing_metrics["total"]), improvement_pct=100.0 * (float(existing_metrics["total"]) - cost) / max(abs(float(existing_metrics["total"])), 1e-12), metrics=metrics, logs=logs, theta_ref=theta_ref, T=T, extra=extra, existing_metrics=existing_metrics, existing_logs=existing_logs, existing_ref=existing_ref, existing_T=existing_T, base_ref=base_ref, base_T=base_T, failed=failed)
+    return dict(case=case, action=np.asarray(action, dtype=np.float32), params=params, reward=reward, raw_reward=float(raw_reward), cost=cost, existing_cost=float(existing_metrics["total_cost"]), improvement_pct=100.0 * (float(existing_metrics["total_cost"]) - cost) / max(abs(float(existing_metrics["total_cost"])), 1e-12), metrics=metrics, logs=logs, theta_ref=theta_ref, T=T, extra=extra, existing_metrics=existing_metrics, existing_logs=existing_logs, existing_ref=existing_ref, existing_T=existing_T, base_ref=base_ref, base_T=base_T, failed=failed)
 
 
 def critic_refine_action(agent: SACGPSAgent, obs: np.ndarray, action_init: np.ndarray, steps: int, lr: float, l2: float) -> np.ndarray:
@@ -498,7 +498,7 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
         upd = agent.update(sac_cfg.updates_per_interaction)
         if step % max(1, eval_every) == 0 or step == 1:
             eval_rows = evaluate_sac_gps_policy(agent, train_cases[:min(8, len(train_cases))], traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 50000 + step, critic_refine=False)
-            mean_existing = float(np.mean([r["existing_metrics"]["total"] for r in eval_rows]))
+            mean_existing = float(np.mean([r["existing_metrics"]["total_cost"] for r in eval_rows]))
             mean_actor = float(np.mean([r["actor_eval"]["cost"] for r in eval_rows]))
             mean_imp = 100.0 * (mean_existing - mean_actor) / max(abs(mean_existing), 1e-12)
             rec = dict(step=step, train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.detach().cpu().item()))
@@ -537,7 +537,7 @@ def evaluate_sac_gps_policy(agent, test_cases, traj_cfg, obj_cfg, sac_cfg, basel
         zero_ev = evaluate_action(case, zero_action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 3000 + i)
         best_ev = min([actor_ev, refined_ev, zero_ev], key=lambda d: d["cost"])
         rows.append(dict(case=case, existing_metrics=existing_metrics, existing_logs=existing_logs, existing_ref=existing_ref, existing_T=existing_T, zero_eval=zero_ev, actor_eval=actor_ev, refined_eval=refined_ev, best_eval=best_ev, actor_metrics=actor_ev["metrics"], refined_metrics=refined_ev["metrics"], best_metrics=best_ev["metrics"]))
-        print(f"eval {case.label()}: existing={existing_metrics['total']:.6g}, actor={actor_ev['cost']:.6g}, refined={refined_ev['cost']:.6g}, best={best_ev['cost']:.6g}, best_imp={best_ev['improvement_pct']:.2f}%")
+        print(f"eval {case.label()}: existing={existing_metrics['total_cost']:.6g}, actor={actor_ev['cost']:.6g}, refined={refined_ev['cost']:.6g}, best={best_ev['cost']:.6g}, best_imp={best_ev['improvement_pct']:.2f}%")
     return rows
 
 
@@ -560,7 +560,7 @@ def plot_evaluation_summary(rows, obj_cfg, save_dir=None, show=True):
     if not rows: return
     labels = [f"{r['case'].theta_goal_deg:.0f}/{r['case'].alpha_deg:.0f}" for r in rows]
     x = np.arange(len(rows))
-    existing = np.array([r["existing_metrics"]["total"] for r in rows], float)
+    existing = np.array([r["existing_metrics"]["total_cost"] for r in rows], float)
     actor = np.array([r["actor_eval"]["cost"] for r in rows], float)
     best = np.array([r["best_eval"]["cost"] for r in rows], float)
     fig = plt.figure(figsize=(max(9,.45*len(rows)),5)); plt.plot(x, existing, marker="o", label="LQR"); plt.plot(x, actor, marker="o", label="SAC actor"); plt.plot(x, best, marker="o", label="best")
