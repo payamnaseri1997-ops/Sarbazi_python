@@ -23,18 +23,6 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except Exception as exc:  # pragma: no cover
-    torch = None
-    nn = None
-    optim = None
-    _TORCH_IMPORT_ERROR = exc
-else:
-    _TORCH_IMPORT_ERROR = None
-
 import LQR_TrjOPt_TDESMCwithRLresidual as sysmod
 
 
@@ -347,20 +335,29 @@ def cem_optimize_case(
 
 #%% ========================= DEEP TRAJECTORY POLICY =========================
 
-class TrajectoryPolicyNet(nn.Module if nn is not None else object):
+class TrajectoryPolicyNet:
     def __init__(self, cfg: TrajectoryPolicyConfig):
-        if torch is None:
-            raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
-        super().__init__()
         h1, h2 = cfg.hidden_sizes
-        self.net = nn.Sequential(
-            nn.Linear(3, h1), nn.Tanh(),
-            nn.Linear(h1, h2), nn.Tanh(),
-            nn.Linear(h2, cfg.n_shape + 1),
-        )
+        out = cfg.n_shape + 1
+        rng = np.random.default_rng(0)
+        self.W1 = rng.normal(0.0, 0.2, size=(3, h1))
+        self.b1 = np.zeros(h1, dtype=float)
+        self.W2 = rng.normal(0.0, 0.2, size=(h1, h2))
+        self.b2 = np.zeros(h2, dtype=float)
+        self.W3 = rng.normal(0.0, 0.2, size=(h2, out))
+        self.b3 = np.zeros(out, dtype=float)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        a1 = np.tanh(x @ self.W1 + self.b1)
+        a2 = np.tanh(a1 @ self.W2 + self.b2)
+        return a2 @ self.W3 + self.b3
+
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(W1=self.W1, b1=self.b1, W2=self.W2, b2=self.b2, W3=self.W3, b3=self.b3)
+
+    def load_state_dict(self, state: Dict[str, np.ndarray]):
+        for k in ("W1", "b1", "W2", "b2", "W3", "b3"):
+            setattr(self, k, np.asarray(state[k], dtype=float))
 
 
 def case_to_policy_input(case: CaseSpec) -> np.ndarray:
@@ -369,26 +366,41 @@ def case_to_policy_input(case: CaseSpec) -> np.ndarray:
 
 
 def fit_policy_to_local_solutions(policy: TrajectoryPolicyNet, cases: Sequence[CaseSpec], params_list: Sequence[np.ndarray], epochs: int = 1500, lr: float = 2e-3, verbose: bool = True):
-    if torch is None:
-        raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
-    x = torch.as_tensor(np.stack([case_to_policy_input(c) for c in cases]), dtype=torch.float32)
-    y = torch.as_tensor(np.stack([np.asarray(p, dtype=np.float32) for p in params_list]), dtype=torch.float32)
-    opt = optim.Adam(policy.parameters(), lr=lr)
+    x = np.stack([case_to_policy_input(c) for c in cases]).astype(float)
+    y = np.stack([np.asarray(p, dtype=float) for p in params_list]).astype(float)
     losses = []
     for ep in range(1, int(epochs) + 1):
-        pred = policy(x)
-        loss = ((pred - y) ** 2).mean()
-        opt.zero_grad(); loss.backward(); opt.step()
-        losses.append(float(loss.detach().cpu().item()))
+        z1 = x @ policy.W1 + policy.b1
+        a1 = np.tanh(z1)
+        z2 = a1 @ policy.W2 + policy.b2
+        a2 = np.tanh(z2)
+        pred = a2 @ policy.W3 + policy.b3
+        err = pred - y
+        loss = float(np.mean(err ** 2))
+        n = x.shape[0]
+        dY = (2.0 / (n * err.shape[1])) * err
+        dW3 = a2.T @ dY
+        db3 = dY.sum(axis=0)
+        dA2 = dY @ policy.W3.T
+        dZ2 = dA2 * (1.0 - np.tanh(z2) ** 2)
+        dW2 = a1.T @ dZ2
+        db2 = dZ2.sum(axis=0)
+        dA1 = dZ2 @ policy.W2.T
+        dZ1 = dA1 * (1.0 - np.tanh(z1) ** 2)
+        dW1 = x.T @ dZ1
+        db1 = dZ1.sum(axis=0)
+        policy.W3 -= lr * dW3; policy.b3 -= lr * db3
+        policy.W2 -= lr * dW2; policy.b2 -= lr * db2
+        policy.W1 -= lr * dW1; policy.b1 -= lr * db1
+        losses.append(loss)
         if verbose and (ep == 1 or ep % 250 == 0 or ep == epochs):
             print(f"policy fit epoch {ep:04d}/{epochs}: mse={losses[-1]:.6g}")
     return losses
 
 
 def policy_params(policy: TrajectoryPolicyNet, case: CaseSpec) -> np.ndarray:
-    x = torch.as_tensor(case_to_policy_input(case), dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
-        p = policy(x).squeeze(0).cpu().numpy()
+    x = case_to_policy_input(case).astype(float)[None, :]
+    p = policy.forward(x).squeeze(0)
     p[:-1] = np.clip(p[:-1], -4.0, 4.0)
     p[-1] = np.clip(p[-1], -4.0, 12.0)
     return p.astype(float)
@@ -476,10 +488,12 @@ def train_gps_trajectory_policy(
 
     policy = TrajectoryPolicyNet(traj_cfg)
     if resume_training:
-        policy.load_state_dict(torch.load(model_path, map_location="cpu"))
+        with np.load(model_path, allow_pickle=False) as data:
+            policy.load_state_dict({k: data[k] for k in data.files})
     losses = fit_policy_to_local_solutions(policy, selected_cases, params_list, epochs=policy_epochs, lr=2e-3) if selected_cases else []
 
-    torch.save(policy.state_dict(), model_path)
+    with open(model_path, "wb") as f:
+        np.savez(f, **policy.state_dict())
     print(f"Saved model to: {model_path}")
     with open(teachers_path, "w") as f:
         json.dump([_case_to_dict(c) for c in train_cases], f, indent=2)
