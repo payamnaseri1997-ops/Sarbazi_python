@@ -27,7 +27,7 @@ import numpy as np
 
 TRJ_TYPE = "LQR"          # "LQR", "NN", or "RL"
 THETA0_DEG = 0.0
-THETA_GOAL_DEG = -90.0
+THETA_GOAL_DEG = 20.0
 SEED = 0
 
 # LQR duration override.  This keeps your old behavior where you used
@@ -63,8 +63,8 @@ L4_C = 0.60
 GAMMA = 0.0
 BETA2 = 0.0
 BETA4 = 0.0
-ALPHA_DEG = 5.0
-PHI_DEG = 3.0
+ALPHA_DEG = .0
+PHI_DEG = .0
 GRAVITY = 9.81
 SUBTRACT_GRAVITY_IN_UEQ = False
 
@@ -181,7 +181,7 @@ class Task:
     theta_goal: float
 
 
-#%% ========================= BASIC UTILITIES =========================
+# ========================= BASIC UTILITIES =========================
 
 def sat(x: float, limit: float) -> float:
     return max(-limit, min(limit, float(x)))
@@ -221,7 +221,7 @@ def softplus_np(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
 
 
-#%% ========================= PLANT DYNAMICS =========================
+# ========================= PLANT DYNAMICS =========================
 
 def J_local_cylinder_z(m: float, a: float) -> float:
     return 0.5 * m * a * a
@@ -313,7 +313,7 @@ class OneDOFRotorPlant:
         return self.state.copy()
 
 
-#%% ========================= LQR REFERENCE =========================
+# ========================= LQR REFERENCE =========================
 
 def build_AB(nom: NominalModel, dt: float) -> Tuple[np.ndarray, np.ndarray]:
     A = np.array([[1.0, dt], [0.0, 1.0 - (nom.b / nom.J) * dt]])
@@ -369,7 +369,7 @@ def explicit_lqr_reference(theta0: float, theta_goal: float, plant_p: PlantParam
     return theta_ref, T
 
 
-#%% ========================= TDE + SMC CONTROLLER =========================
+# ========================= TDE + SMC CONTROLLER =========================
 
 class TDE_SMC_Discrete:
     def __init__(self, hatJ: float, hatb: float, dt: float, u_max: float, tau_i: float, K_t: float, smc: SMCConfig):
@@ -425,7 +425,7 @@ class TDE_SMC_Discrete:
         return u_total, info
 
 
-#%% ========================= SYSTEM BUILDER =========================
+# ========================= SYSTEM BUILDER =========================
 
 def build_system_from_settings():
     plant_p = PlantParams(
@@ -442,7 +442,7 @@ def build_system_from_settings():
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
 
-#%% ========================= NN / RL TRAJECTORY LOADING =========================
+# ========================= NN / RL TRAJECTORY LOADING =========================
 
 def torch_import():
     try:
@@ -624,7 +624,7 @@ def build_trajectory_reference(trj_type: str, theta0: float, theta_goal: float, 
     raise ValueError("TRJ_TYPE must be 'LQR', 'NN', or 'RL'")
 
 
-#%% ========================= PURE TDE+SMC ROLLOUT =========================
+# ========================= PURE TDE+SMC ROLLOUT =========================
 
 def rollout_once(
     plant: OneDOFRotorPlant,
@@ -643,42 +643,80 @@ def rollout_once(
 
     np.random.seed(seed)
     dt = plant.p.dt
+
+    # Default horizon if no explicit reference is provided.
     horizon_s = time_horizon(task.theta0, task.theta_goal)
+
+    # Reference options supplied by caller.
     ref_opts = {} if reference is None else dict(reference)
+
+    # If caller gives duration, use it as the rollout horizon.
     if "duration" in ref_opts:
         horizon_s = float(ref_opts["duration"])
+
     N = max(1, int(round(horizon_s / dt)))
 
     ref_kind = str(ref_opts.get("kind", "LQR")).upper()
     has_theta = "theta" in ref_opts
+
+    # Clean rule:
+    # If the caller explicitly provides either:
+    #   1) a duration, or
+    #   2) a theta reference array,
+    # then run the controller for the full requested reference/horizon.
+    #
+    # Only allow early stopping when no explicit reference/duration was requested.
+    force_full_reference_duration = ("duration" in ref_opts) or has_theta
+
     if (not has_theta) and ref_kind in ("LQR", "ILQR", "OPTIMIZED"):
         reference_kind = "LQR"
         x_ref, _ = generate_reference_ilqr_like(
-            nom, plant.p,
+            nom,
+            plant.p,
             np.array([task.theta0, task.omega0], dtype=float),
             np.array([task.theta_goal, 0.0], dtype=float),
-            N, dt, lqr_w,
+            N,
+            dt,
+            lqr_w,
         )
         theta_ref = np.concatenate([[task.theta0], x_ref[:-1, 0]])
+
     elif has_theta:
         reference_kind = ref_kind
-        theta_seq = np.asarray(ref_opts["theta"], dtype=float)
+        theta_seq = np.asarray(ref_opts["theta"], dtype=float).reshape(-1)
+
         if len(theta_seq) == N + 1:
             theta_ref = theta_seq.copy()
+
         elif len(theta_seq) == N:
             theta_ref = np.empty(N + 1, dtype=float)
             theta_ref[0] = task.theta0
             theta_ref[1:] = theta_seq
+
         else:
-            raise ValueError(f"Custom theta trajectory length {len(theta_seq)} does not match expected {N} or {N + 1}")
+            raise ValueError(
+                f"Custom theta trajectory length {len(theta_seq)} does not match "
+                f"expected {N} or {N + 1}. "
+                f"duration={horizon_s}, dt={dt}, N={N}"
+            )
+
         theta_ref[0] = task.theta0
+
     else:
         raise ValueError(f"Unknown reference kind: {ref_kind}")
 
     omega_ref = finite_diff(theta_ref, dt)
     alpha_ref = finite_diff(omega_ref, dt)
 
-    smc = TDE_SMC_Discrete(nom.J, nom.b, plant.p.dt, plant.p.u_max, plant.p.tau_i, plant.p.K_t, smc_cfg)
+    smc = TDE_SMC_Discrete(
+        nom.J,
+        nom.b,
+        plant.p.dt,
+        plant.p.u_max,
+        plant.p.tau_i,
+        plant.p.K_t,
+        smc_cfg,
+    )
     smc.subtract_gravity_in_ueq = plant.p.subtract_gravity_in_ueq
     smc.reset()
     plant.reset(theta0=task.theta0, omega0=task.omega0)
@@ -710,17 +748,34 @@ def rollout_once(
 
     for k in range(N):
         theta, omega, tau_m = plant.state.copy()
+
         theta_ref_k = theta_ref[k]
         theta_ref_k1 = theta_ref[min(k + 1, N)]
+
         omega_ref_k = omega_ref[k]
         omega_ref_k1 = omega_ref[min(k + 1, N)]
 
-        u_cmd, info = smc.control(theta, omega, theta_ref_k, theta_ref_k1, omega_ref_k, omega_ref_k1, u_rl=0.0, plant=plant)
+        u_cmd, info = smc.control(
+            theta,
+            omega,
+            theta_ref_k,
+            theta_ref_k1,
+            omega_ref_k,
+            omega_ref_k1,
+            u_rl=0.0,
+            plant=plant,
+        )
+
         plant.step(u_cmd)
 
         e = info["e"]
         edot = info["edot"]
-        stage = cost_cfg.w_e * e * e + cost_cfg.w_edot * edot * edot + cost_cfg.w_omega * omega * omega
+
+        stage = (
+            cost_cfg.w_e * e * e
+            + cost_cfg.w_edot * edot * edot
+            + cost_cfg.w_omega * omega * omega
+        )
         total_cost += stage * dt
 
         theta2, omega2, _ = plant.state.copy()
@@ -732,9 +787,11 @@ def rollout_once(
             th_ref_log[k] = theta_ref_k
             om_ref_log[k] = omega_ref_k
             al_ref_log[k] = alpha_ref[k]
+
             th_log[k] = theta
             om_log[k] = omega
             tau_m_log[k] = tau_m
+
             u_rl_log[k] = 0.0
             u_eq_log[k] = info["u_eq"]
             u_s_log[k] = info["u_s"]
@@ -744,28 +801,54 @@ def rollout_once(
             u_tde_log[k] = -info["d_hat"]
             u_smc_log[k] = info["u_smc"]
             u_total_log[k] = info["u_total"]
+
             dist_log[k] = plant.last_disturbance
             gravity_log[k] = plant.last_gravity
 
         steps_taken = k + 1
-        if done:
+
+        # Only stop early when no explicit reference/duration was requested.
+        # If a duration or theta reference was provided, continue to the full horizon.
+        if done and not force_full_reference_duration:
             break
+
         t += dt
 
-    metrics = dict(total_cost=total_cost, finished=1.0 if done else 0.0, time=t)
+    metrics = dict(
+        total_cost=total_cost,
+        finished=1.0 if done else 0.0,
+        time=t,
+    )
+
     if not collect_logs:
         return metrics, None
 
     steps = steps_taken
-    logs = dict(
-        t=t_log[:steps], theta_ref=th_ref_log[:steps], omega_ref=om_ref_log[:steps], alpha_ref=al_ref_log[:steps],
-        theta=th_log[:steps], omega=om_log[:steps], tau_m=tau_m_log[:steps], u_rl=u_rl_log[:steps],
-        u_eq=u_eq_log[:steps], u_s=u_s_log[:steps], s=s_log[:steps], eta_hat=eta_hat_log[:steps],
-        d_hat=d_hat_log[:steps], u_tde=u_tde_log[:steps], u_smc=u_smc_log[:steps], u_total=u_total_log[:steps],
-        disturbance=dist_log[:steps], gravity=gravity_log[:steps], reference_kind=reference_kind,
-    )
-    return metrics, logs
 
+    logs = dict(
+        t=t_log[:steps],
+        theta_ref=th_ref_log[:steps],
+        omega_ref=om_ref_log[:steps],
+        alpha_ref=al_ref_log[:steps],
+        theta=th_log[:steps],
+        omega=om_log[:steps],
+        tau_m=tau_m_log[:steps],
+        u_rl=u_rl_log[:steps],
+        u_eq=u_eq_log[:steps],
+        u_s=u_s_log[:steps],
+        s=s_log[:steps],
+        eta_hat=eta_hat_log[:steps],
+        d_hat=d_hat_log[:steps],
+        u_tde=u_tde_log[:steps],
+        u_smc=u_smc_log[:steps],
+        u_total=u_total_log[:steps],
+        disturbance=dist_log[:steps],
+        gravity=gravity_log[:steps],
+        reference_kind=reference_kind,
+        force_full_reference_duration=force_full_reference_duration,
+    )
+
+    return metrics, logs
 
 def evaluate_and_rollout(trj_type: str = TRJ_TYPE) -> Dict[str, np.ndarray]:
     plant_p, nom, lqr_w, smc_cfg, cost_cfg = build_system_from_settings()
@@ -780,7 +863,7 @@ def evaluate_and_rollout(trj_type: str = TRJ_TYPE) -> Dict[str, np.ndarray]:
     return logs
 
 
-#%% ========================= PLOT HELPER =========================
+# ========================= PLOT HELPER =========================
 
 def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
     import matplotlib.pyplot as plt
