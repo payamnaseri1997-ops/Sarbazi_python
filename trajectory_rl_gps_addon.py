@@ -22,6 +22,7 @@ import math
 import json
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Optional
 
 import LQR_TrjOPt_TDESMCwithRLresidual as sysmod
 
@@ -122,7 +123,7 @@ def make_cases(goal_degs: Sequence[float], tilt_degs: Sequence[float], coupled_t
     return cases
 
 
-#%% ========================= TRAJECTORY PARAMETERIZATION =========================
+# ========================= TRAJECTORY PARAMETERIZATION =========================
 
 def _softplus_np(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
@@ -174,7 +175,7 @@ def build_monotone_reference(
     return t, theta_ref, omega_ref, T
 
 
-#%% ========================= SYSTEM ROLLOUT THROUGH LQR MAIN FILE =========================
+# ========================= SYSTEM ROLLOUT THROUGH LQR MAIN FILE =========================
 
 def base_lqr_reference(case: CaseSpec, theta0: float = 0.0) -> Tuple[np.ndarray, float]:
     plant_p, nom, lqr_w, _, _ = system_for_case(case)
@@ -275,7 +276,7 @@ def evaluate_params_for_case(case: CaseSpec, params: np.ndarray, traj_cfg: Traje
     return metrics, logs, theta_ref, T
 
 
-#%% ========================= LOCAL CEM TEACHER =========================
+# ========================= LOCAL CEM TEACHER =========================
 
 def cem_optimize_case(
     case: CaseSpec,
@@ -333,7 +334,7 @@ def cem_optimize_case(
     return best
 
 
-#%% ========================= DEEP TRAJECTORY POLICY =========================
+# ========================= DEEP TRAJECTORY POLICY =========================
 
 class TrajectoryPolicyNet:
     def __init__(self, cfg: TrajectoryPolicyConfig):
@@ -520,7 +521,7 @@ def evaluate_policy_vs_existing(policy: TrajectoryPolicyNet, cases: Sequence[Cas
     return rows
 
 
-#%% ========================= PLOTS / RUNNER =========================
+# ========================= PLOTS / RUNNER =========================
 
 def _maybe_save(fig, save_dir: Optional[str], name: str, show: bool):
     if save_dir is not None:
@@ -560,10 +561,10 @@ def plot_evaluation_summary(rows: Sequence[Dict[str, object]], save_dir: Optiona
     plt.legend(); plt.grid(True, axis="y", linestyle="--", alpha=0.6)
     _maybe_save(fig, save_dir, "cost_comparison.png", show)
 
-
+#%%
 def run_full_trajectory_rl_experiment(
-    train_goal_degs: Sequence[float] = (30, 60, 90, 120, 150, 180),
-    test_goal_degs: Sequence[float] = (15, 45, 75, 105, 135, 165, 180),
+    train_goal_degs: Sequence[float] = (70, 80),
+    test_goal_degs: Sequence[float] = (60, 75),
     tilt_degs: Sequence[float] = (0,5, 8, 15, 20),
     cem_iters: int = 8,
     population: int = 24,
@@ -586,13 +587,245 @@ def run_full_trajectory_rl_experiment(
 
 
 #%% ========================= RUN IN SPYDER =========================
-if __name__ == "__main__":
-    results = run_full_trajectory_rl_experiment(
-        cem_iters=4,
-        population=12,
-        policy_epochs=300,
-        save_dir="trajectory_rl_results_smoke",
-        show_plots=True,
-        resume_training=False,
+results = run_full_trajectory_rl_experiment(
+    cem_iters=10,
+    population=50,
+    policy_epochs=3000,
+    save_dir="trajectory_rl_results_smoke",
+    show_plots=True,
+    resume_training=True,
+)
+# To continue training from saved weights, set resume_training=True.
+
+#%% ========================= INLINE SINGLE GOAL COMPARISON =========================
+
+# Choose your single test condition here
+theta_goal_deg = 60.0
+alpha_deg = 10.0
+phi_deg = 0.0
+
+save_dir = "trajectory_rl_results_smoke"
+model_filename = "trajectory_policy.pt"
+show_plots = True
+
+# Build configs
+traj_cfg, obj_cfg = make_default_configs()
+
+# Build one case
+case = CaseSpec(
+    theta_goal=math.radians(theta_goal_deg),
+    alpha=math.radians(alpha_deg),
+    phi=math.radians(phi_deg),
+)
+
+print("\n================ SINGLE GOAL COMPARISON ================")
+print(f"theta_goal = {theta_goal_deg:.2f} deg")
+print(f"alpha      = {alpha_deg:.2f} deg")
+print(f"phi        = {phi_deg:.2f} deg")
+
+# ---------------------------------------------------------
+# 1) Load trained NN/GPS trajectory policy
+# ---------------------------------------------------------
+model_path = os.path.join(save_dir, model_filename)
+
+if not os.path.exists(model_path):
+    raise FileNotFoundError(
+        f"Could not find trained trajectory policy at:\n{model_path}\n\n"
+        "First run training, or set save_dir/model_filename correctly."
     )
-    # To continue training from saved weights, set resume_training=True.
+
+policy = TrajectoryPolicyNet(traj_cfg)
+
+with np.load(model_path, allow_pickle=False) as data:
+    policy.load_state_dict({k: data[k] for k in data.files})
+
+print(f"Loaded NN/GPS trajectory policy from: {model_path}")
+
+# ---------------------------------------------------------
+# 2) Generate NN/GPS reference trajectory
+# ---------------------------------------------------------
+plant_p, _, _, _, _ = system_for_case(case)
+
+gps_params = policy_params(policy, case)
+
+_, gps_theta_ref, gps_omega_ref, gps_T = build_monotone_reference(
+    theta_goal=case.theta_goal,
+    params=gps_params,
+    dt=plant_p.dt,
+    cfg=traj_cfg,
+    theta0=0.0,
+)
+
+print(f"Generated NN/GPS reference duration: {gps_T:.4f} s")
+
+# ---------------------------------------------------------
+# 3) Track NN/GPS reference using LQR/TDE/SMC system
+# ---------------------------------------------------------
+gps_raw_metrics, gps_logs, gps_plant_p = simulate_reference(
+    case=case,
+    theta_ref=gps_theta_ref,
+    duration=gps_T,
+    seed=123,
+    theta0=0.0,
+)
+
+gps_metrics = trajectory_objective(
+    logs=gps_logs,
+    theta_goal=case.theta_goal,
+    plant_p=gps_plant_p,
+    obj_cfg=obj_cfg,
+)
+
+# ---------------------------------------------------------
+# 4) Track original LQR reference
+# ---------------------------------------------------------
+lqr_raw_metrics, lqr_logs, lqr_theta_ref, lqr_T, lqr_plant_p = simulate_existing_reference(
+    case=case,
+    seed=123,
+    theta0=0.0,
+)
+
+lqr_metrics = trajectory_objective(
+    logs=lqr_logs,
+    theta_goal=case.theta_goal,
+    plant_p=lqr_plant_p,
+    obj_cfg=obj_cfg,
+)
+
+# ---------------------------------------------------------
+# 5) Print comparison summary
+# ---------------------------------------------------------
+lqr_cost = float(lqr_metrics["total_cost"])
+gps_cost = float(gps_metrics["total_cost"])
+
+improvement = lqr_cost - gps_cost
+improvement_ratio = improvement / max(abs(lqr_cost), 1e-12)
+
+print("\n---------------- RESULTS ----------------")
+print(f"LQR total cost     = {lqr_cost:.6g}")
+print(f"NN/GPS total cost  = {gps_cost:.6g}")
+print(f"Improvement        = {improvement:.6g}")
+print(f"Improvement ratio  = {100.0 * improvement_ratio:.2f} %")
+
+print("\nFinal theta error:")
+print(f"LQR    = {lqr_metrics['final_theta_error']:.6g} rad "
+      f"({math.degrees(lqr_metrics['final_theta_error']):.4f} deg)")
+print(f"NN/GPS = {gps_metrics['final_theta_error']:.6g} rad "
+      f"({math.degrees(gps_metrics['final_theta_error']):.4f} deg)")
+
+print("\nMax values:")
+print(f"LQR max |u_command|     = {lqr_metrics['max_abs_u_total']:.6g}")
+print(f"GPS max |u_command|     = {gps_metrics['max_abs_u_total']:.6g}")
+print(f"LQR max |tau_m|         = {lqr_metrics['max_abs_tau_m']:.6g}")
+print(f"GPS max |tau_m|         = {gps_metrics['max_abs_tau_m']:.6g}")
+
+# ---------------------------------------------------------
+# 6) Extract logs safely
+# ---------------------------------------------------------
+t_lqr = np.asarray(lqr_logs["t"], dtype=float)
+theta_lqr = np.asarray(lqr_logs["theta"], dtype=float)
+theta_ref_lqr = np.asarray(lqr_logs["theta_ref"], dtype=float)
+omega_lqr = np.asarray(lqr_logs["omega"], dtype=float)
+omega_ref_lqr = np.asarray(lqr_logs["omega_ref"], dtype=float)
+u_lqr = np.asarray(lqr_logs["u_total"], dtype=float)
+tau_lqr = np.asarray(lqr_logs.get("tau_m", lqr_logs["u_total"]), dtype=float)
+
+t_gps = np.asarray(gps_logs["t"], dtype=float)
+theta_gps = np.asarray(gps_logs["theta"], dtype=float)
+theta_ref_gps = np.asarray(gps_logs["theta_ref"], dtype=float)
+omega_gps = np.asarray(gps_logs["omega"], dtype=float)
+omega_ref_gps = np.asarray(gps_logs["omega_ref"], dtype=float)
+u_gps = np.asarray(gps_logs["u_total"], dtype=float)
+tau_gps = np.asarray(gps_logs.get("tau_m", gps_logs["u_total"]), dtype=float)
+
+if "tau_m" not in lqr_logs:
+    print("Warning: tau_m not found in LQR logs. Used u_total as fallback.")
+
+if "tau_m" not in gps_logs:
+    print("Warning: tau_m not found in NN/GPS logs. Used u_total as fallback.")
+
+# ---------------------------------------------------------
+# 7) Plot theta
+# ---------------------------------------------------------
+fig = plt.figure(figsize=(9, 5))
+plt.plot(t_lqr, theta_lqr, label="LQR actual theta")
+plt.plot(t_lqr, theta_ref_lqr, "--", label="LQR reference theta")
+plt.plot(t_gps, theta_gps, label="NN/GPS actual theta")
+plt.plot(t_gps, theta_ref_gps, "--", label="NN/GPS reference theta")
+plt.xlabel("Time [s]")
+plt.ylabel("Theta [rad]")
+plt.title("Theta tracking comparison")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "single_goal_theta.png"), dpi=180)
+if show_plots:
+    plt.show()
+else:
+    plt.close(fig)
+
+# ---------------------------------------------------------
+# 8) Plot theta dot / omega
+# ---------------------------------------------------------
+fig = plt.figure(figsize=(9, 5))
+plt.plot(t_lqr, omega_lqr, label="LQR actual omega")
+plt.plot(t_lqr, omega_ref_lqr, "--", label="LQR reference omega")
+plt.plot(t_gps, omega_gps, label="NN/GPS actual omega")
+plt.plot(t_gps, omega_ref_gps, "--", label="NN/GPS reference omega")
+plt.xlabel("Time [s]")
+plt.ylabel("Omega / theta_dot [rad/s]")
+plt.title("Angular velocity tracking comparison")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "single_goal_omega.png"), dpi=180)
+if show_plots:
+    plt.show()
+else:
+    plt.close(fig)
+
+# ---------------------------------------------------------
+# 9) Plot u command
+# ---------------------------------------------------------
+fig = plt.figure(figsize=(9, 5))
+plt.plot(t_lqr, u_lqr, label="LQR u_command")
+plt.plot(t_gps, u_gps, label="NN/GPS u_command")
+plt.xlabel("Time [s]")
+plt.ylabel("u_command")
+plt.title("Command input comparison")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "single_goal_u_command.png"), dpi=180)
+if show_plots:
+    plt.show()
+else:
+    plt.close(fig)
+
+# ---------------------------------------------------------
+# 10) Plot induced torque tau_m
+# ---------------------------------------------------------
+fig = plt.figure(figsize=(9, 5))
+plt.plot(t_lqr, tau_lqr, label="LQR induced torque tau_m")
+plt.plot(t_gps, tau_gps, label="NN/GPS induced torque tau_m")
+plt.xlabel("Time [s]")
+plt.ylabel("tau_m")
+plt.title("Induced torque comparison")
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(save_dir, "single_goal_tau_m.png"), dpi=180)
+if show_plots:
+    plt.show()
+else:
+    plt.close(fig)
+
+print("\nSaved figures:")
+print(os.path.join(save_dir, "single_goal_theta.png"))
+print(os.path.join(save_dir, "single_goal_omega.png"))
+print(os.path.join(save_dir, "single_goal_u_command.png"))
+print(os.path.join(save_dir, "single_goal_tau_m.png"))
+
+print("========================================================\n")
+
+
