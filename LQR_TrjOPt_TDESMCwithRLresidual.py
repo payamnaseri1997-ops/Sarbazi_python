@@ -27,7 +27,7 @@ import numpy as np
 
 TRJ_TYPE = "LQR"          # "LQR", "NN", or "RL"
 THETA0_DEG = 0.0
-THETA_GOAL_DEG = 20.0
+THETA_GOAL_DEG = 10.0
 SEED = 0
 
 # LQR duration override.  This keeps your old behavior where you used
@@ -81,9 +81,31 @@ LQR_QT_OMEGA = 220.0
 LQR_OMEGA_LIMIT_PENALTY = 1000.0
 
 # TDE+SMC controller gains.
-SMC_LAMBDA = 35.0
+SMC_LAMBDA = 80.0
 SMC_K = 0.85
 SMC_PHI = 0.025
+
+# Prescribed Performance Control switch.
+
+USE_PP = True  # False = original TDE+SMC exactly as before. True  = TDE + SMC on transformed prescribed-performance error.
+
+# PP bound:
+#   -rho(t) < e_theta(t) < +rho(t)
+#
+# rho(t) = (PP_RHO0 - PP_RHO_INF) * exp(-PP_DECAY * t) + PP_RHO_INF
+#
+# PP_RHO_INF should be below your final error requirement.
+# Example: 0.008 rad means final tracking bound is below 0.01 rad.
+PP_RHO0 = 0.25          # initial transient error bound [rad]
+PP_RHO_INF = 0.008      # final steady-state error bound [rad]
+PP_DECAY = 0.35        # bound decay rate [1/s]
+PP_CLIP = 0.98          # safety clamp for normalized error, must be < 1.0
+
+# Optional SMC gains used only when USE_PP=True.
+# Model/plant parameters are unchanged; only SMC parameters change.
+PP_SMC_LAMBDA = 45.0
+PP_SMC_K = 80.0
+PP_SMC_PHI = 0.05
 
 # Rollout cost used only for reporting total_cost.
 COST_W_E = 8.0
@@ -164,6 +186,18 @@ class SMCConfig:
     lambda_s: float
     k: float
     phi: float
+
+    # Prescribed Performance options
+    use_pp: bool = False
+    pp_rho0: float = 0.25
+    pp_rho_inf: float = 0.008
+    pp_decay: float = 0.035
+    pp_clip: float = 0.98
+
+    # Optional SMC gains used only when use_pp=True
+    pp_lambda_s: float = 45.0
+    pp_k: float = 80.0
+    pp_phi: float = 0.05
 
 @dataclass
 class CostConfig:
@@ -372,7 +406,16 @@ def explicit_lqr_reference(theta0: float, theta_goal: float, plant_p: PlantParam
 # ========================= TDE + SMC CONTROLLER =========================
 
 class TDE_SMC_Discrete:
-    def __init__(self, hatJ: float, hatb: float, dt: float, u_max: float, tau_i: float, K_t: float, smc: SMCConfig):
+    def __init__(
+        self,
+        hatJ: float,
+        hatb: float,
+        dt: float,
+        u_max: float,
+        tau_i: float,
+        K_t: float,
+        smc: SMCConfig,
+    ):
         self.hatJ = hatJ
         self.hatb = hatb
         self.dt = dt
@@ -380,6 +423,7 @@ class TDE_SMC_Discrete:
         self.tau_i = tau_i
         self.K_t = K_t
         self.cfg = smc
+
         self.tau_m_hat = 0.0
         self.omega_hist: List[float] = []
         self.tau_m_hat_hist: List[float] = []
@@ -390,10 +434,115 @@ class TDE_SMC_Discrete:
         self.omega_hist.clear()
         self.tau_m_hat_hist.clear()
 
-    def control(self, theta: float, omega: float, theta_ref_k: float, theta_ref_k1: float, omega_ref_k: float, omega_ref_k1: float, u_rl: float = 0.0, plant: Optional[OneDOFRotorPlant] = None) -> Tuple[float, Dict[str, float]]:
+    def pp_rho(self, t: float) -> Tuple[float, float]:
+        """
+        Prescribed performance bound:
+
+            rho(t) = (rho0 - rho_inf) exp(-l t) + rho_inf
+
+        Returns:
+            rho, rho_dot
+        """
+        rho0 = float(self.cfg.pp_rho0)
+        rho_inf = float(self.cfg.pp_rho_inf)
+        decay = float(self.cfg.pp_decay)
+
+        rho = (rho0 - rho_inf) * math.exp(-decay * float(t)) + rho_inf
+        rho_dot = -decay * (rho - rho_inf)
+
+        rho = max(rho, 1e-9)
+        return float(rho), float(rho_dot)
+
+    def pp_transform(self, e: float, edot: float, t: float) -> Dict[str, float]:
+        """
+        Symmetric prescribed-performance error transformation.
+
+        Bound:
+            -rho(t) < e(t) < rho(t)
+
+        Normalized error:
+            xi = e / rho
+
+        Transformed error:
+            eps = 0.5 * ln((1 + xi) / (1 - xi))
+                = atanh(xi)
+
+        Derivative:
+            eps_dot = (edot - xi * rho_dot) / (rho * (1 - xi^2))
+        """
+        rho, rho_dot = self.pp_rho(t)
+
+        xi_raw = float(e) / rho
+
+        # Keep the transformation numerically safe.
+        # If abs(xi_raw) >= 1, the prescribed bound has been violated.
+        xi = float(np.clip(xi_raw, -self.cfg.pp_clip, self.cfg.pp_clip))
+
+        eps = 0.5 * math.log((1.0 + xi) / (1.0 - xi))
+        eps_dot = (float(edot) - xi * rho_dot) / max(rho * (1.0 - xi * xi), 1e-9)
+
+        violation = max(abs(xi_raw) - 1.0, 0.0)
+
+        return dict(
+            pp_rho=rho,
+            pp_rho_dot=rho_dot,
+            pp_upper=rho,
+            pp_lower=-rho,
+            pp_xi=xi,
+            pp_xi_raw=xi_raw,
+            pp_eps=eps,
+            pp_eps_dot=eps_dot,
+            pp_violation=violation,
+        )
+
+    def control(
+        self,
+        theta: float,
+        omega: float,
+        theta_ref_k: float,
+        theta_ref_k1: float,
+        omega_ref_k: float,
+        omega_ref_k1: float,
+        u_rl: float = 0.0,
+        plant: Optional[OneDOFRotorPlant] = None,
+        t: float = 0.0,
+    ) -> Tuple[float, Dict[str, float]]:
+
+        # Physical tracking error
         e = theta - theta_ref_k
         edot = omega - omega_ref_k
-        s = edot + self.cfg.lambda_s * e
+
+        use_pp = bool(self.cfg.use_pp)
+
+        if use_pp:
+            pp = self.pp_transform(e=e, edot=edot, t=t)
+
+            lambda_s = float(self.cfg.pp_lambda_s)
+            k_smc = float(self.cfg.pp_k)
+            phi_smc = float(self.cfg.pp_phi)
+
+            # SMC stabilizes transformed PP error
+            s = pp["pp_eps_dot"] + lambda_s * pp["pp_eps"]
+
+        else:
+            pp = dict(
+                pp_rho=np.nan,
+                pp_rho_dot=np.nan,
+                pp_upper=np.nan,
+                pp_lower=np.nan,
+                pp_xi=np.nan,
+                pp_xi_raw=np.nan,
+                pp_eps=np.nan,
+                pp_eps_dot=np.nan,
+                pp_violation=0.0,
+            )
+
+            lambda_s = float(self.cfg.lambda_s)
+            k_smc = float(self.cfg.k)
+            phi_smc = float(self.cfg.phi)
+
+            # Original SMC surface
+            s = edot + lambda_s * e
 
         self.omega_hist.append(omega)
         if len(self.omega_hist) > 2:
@@ -407,23 +556,54 @@ class TDE_SMC_Discrete:
 
         dtheta_ref = theta_ref_k1 - theta_ref_k
         domega_ref = omega_ref_k1 - omega_ref_k
-        denom = self.dt * (1.0 + self.cfg.lambda_s * self.dt)
-        u_eq = self.hatb * omega + (self.hatJ / denom) * (domega_ref - self.cfg.lambda_s * (self.dt * omega - dtheta_ref))
+
+        # TDE equivalent part.
+        # Same structure as before.
+        # When USE_PP=True, only the SMC surface/gains are changed.
+        denom = self.dt * (1.0 + lambda_s * self.dt)
+
+        u_eq = (
+            self.hatb * omega
+            + (self.hatJ / denom)
+            * (domega_ref - lambda_s * (self.dt * omega - dtheta_ref))
+        )
+
         if self.subtract_gravity_in_ueq and plant is not None:
             u_eq = u_eq - plant.gravity_torque(theta)
 
-        u_s = -self.cfg.k * np.tanh(s / (self.cfg.phi + 1e-9))
+        # SMC robust part.
+        # If USE_PP=True, this stabilizes transformed PP error.
+        # If USE_PP=False, this is the original SMC term.
+        u_s = -k_smc * np.tanh(s / (phi_smc + 1e-9))
+
         u_total = sat(u_eq - d_hat + u_s + u_rl, self.u_max)
 
-        tau_m_hat_next = self.tau_m_hat + self.dt * (-(1.0 / self.tau_i) * self.tau_m_hat + (self.K_t / self.tau_i) * u_total)
+        tau_m_hat_next = self.tau_m_hat + self.dt * (
+            -(1.0 / self.tau_i) * self.tau_m_hat
+            + (self.K_t / self.tau_i) * u_total
+        )
+
         self.tau_m_hat = tau_m_hat_next
         self.tau_m_hat_hist.append(tau_m_hat_next)
         if len(self.tau_m_hat_hist) > 2:
             self.tau_m_hat_hist.pop(0)
 
-        info = dict(e=e, edot=edot, s=s, eta_hat=eta_hat, d_hat=d_hat, u_eq=u_eq, u_s=u_s, u_smc=u_eq - d_hat + u_s, u_total=u_total)
-        return u_total, info
+        info = dict(
+            e=e,
+            edot=edot,
+            s=s,
+            eta_hat=eta_hat,
+            d_hat=d_hat,
+            u_eq=u_eq,
+            u_s=u_s,
+            u_smc=u_eq - d_hat + u_s,
+            u_total=u_total,
+            use_pp=use_pp,
+        )
 
+        info.update(pp)
+
+        return u_total, info
 
 # ========================= SYSTEM BUILDER =========================
 
@@ -437,7 +617,21 @@ def build_system_from_settings():
     )
     nom = NominalModel(J=NOMINAL_J, b=NOMINAL_B)
     lqr_w = LQRWeights(q_theta=LQR_Q_THETA, q_omega=LQR_Q_OMEGA, r_u=LQR_R_U, qT_theta=LQR_QT_THETA, qT_omega=LQR_QT_OMEGA, omega_limit_penalty=LQR_OMEGA_LIMIT_PENALTY)
-    smc_cfg = SMCConfig(lambda_s=SMC_LAMBDA, k=SMC_K, phi=SMC_PHI)
+    smc_cfg = SMCConfig(
+    lambda_s=SMC_LAMBDA,
+    k=SMC_K,
+    phi=SMC_PHI,
+
+    use_pp=USE_PP,
+    pp_rho0=PP_RHO0,
+    pp_rho_inf=PP_RHO_INF,
+    pp_decay=PP_DECAY,
+    pp_clip=PP_CLIP,
+
+    pp_lambda_s=PP_SMC_LAMBDA,
+    pp_k=PP_SMC_K,
+    pp_phi=PP_SMC_PHI,
+)
     cost_cfg = CostConfig(w_e=COST_W_E, w_edot=COST_W_EDOT, w_u=COST_W_U, w_omega=COST_W_OMEGA, goal_tol=GOAL_TOL, done_bonus=DONE_BONUS)
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
@@ -644,13 +838,9 @@ def rollout_once(
     np.random.seed(seed)
     dt = plant.p.dt
 
-    # Default horizon if no explicit reference is provided.
     horizon_s = time_horizon(task.theta0, task.theta_goal)
-
-    # Reference options supplied by caller.
     ref_opts = {} if reference is None else dict(reference)
 
-    # If caller gives duration, use it as the rollout horizon.
     if "duration" in ref_opts:
         horizon_s = float(ref_opts["duration"])
 
@@ -660,12 +850,8 @@ def rollout_once(
     has_theta = "theta" in ref_opts
 
     # Clean rule:
-    # If the caller explicitly provides either:
-    #   1) a duration, or
-    #   2) a theta reference array,
-    # then run the controller for the full requested reference/horizon.
-    #
-    # Only allow early stopping when no explicit reference/duration was requested.
+    # If duration or theta reference is explicitly provided,
+    # run the full requested trajectory instead of stopping early.
     force_full_reference_duration = ("duration" in ref_opts) or has_theta
 
     if (not has_theta) and ref_kind in ("LQR", "ILQR", "OPTIMIZED"):
@@ -723,12 +909,15 @@ def rollout_once(
 
     if collect_logs:
         t_log = np.zeros(N)
+
         th_ref_log = np.zeros(N)
         om_ref_log = np.zeros(N)
         al_ref_log = np.zeros(N)
+
         th_log = np.zeros(N)
         om_log = np.zeros(N)
         tau_m_log = np.zeros(N)
+
         u_rl_log = np.zeros(N)
         u_eq_log = np.zeros(N)
         u_s_log = np.zeros(N)
@@ -738,8 +927,21 @@ def rollout_once(
         u_tde_log = np.zeros(N)
         u_smc_log = np.zeros(N)
         u_total_log = np.zeros(N)
+
         dist_log = np.zeros(N)
         gravity_log = np.zeros(N)
+
+        # PP logs
+        e_log = np.zeros(N)
+        edot_log = np.zeros(N)
+        pp_rho_log = np.full(N, np.nan)
+        pp_upper_log = np.full(N, np.nan)
+        pp_lower_log = np.full(N, np.nan)
+        pp_xi_log = np.full(N, np.nan)
+        pp_xi_raw_log = np.full(N, np.nan)
+        pp_eps_log = np.full(N, np.nan)
+        pp_eps_dot_log = np.full(N, np.nan)
+        pp_violation_log = np.zeros(N)
 
     total_cost = 0.0
     done = False
@@ -764,6 +966,7 @@ def rollout_once(
             omega_ref_k1,
             u_rl=0.0,
             plant=plant,
+            t=t,
         )
 
         plant.step(u_cmd)
@@ -784,6 +987,7 @@ def rollout_once(
 
         if collect_logs:
             t_log[k] = t
+
             th_ref_log[k] = theta_ref_k
             om_ref_log[k] = omega_ref_k
             al_ref_log[k] = alpha_ref[k]
@@ -805,10 +1009,20 @@ def rollout_once(
             dist_log[k] = plant.last_disturbance
             gravity_log[k] = plant.last_gravity
 
+            e_log[k] = info["e"]
+            edot_log[k] = info["edot"]
+
+            pp_rho_log[k] = info["pp_rho"]
+            pp_upper_log[k] = info["pp_upper"]
+            pp_lower_log[k] = info["pp_lower"]
+            pp_xi_log[k] = info["pp_xi"]
+            pp_xi_raw_log[k] = info["pp_xi_raw"]
+            pp_eps_log[k] = info["pp_eps"]
+            pp_eps_dot_log[k] = info["pp_eps_dot"]
+            pp_violation_log[k] = info["pp_violation"]
+
         steps_taken = k + 1
 
-        # Only stop early when no explicit reference/duration was requested.
-        # If a duration or theta reference was provided, continue to the full horizon.
         if done and not force_full_reference_duration:
             break
 
@@ -820,6 +1034,13 @@ def rollout_once(
         time=t,
     )
 
+    if collect_logs:
+        if bool(smc_cfg.use_pp):
+            max_pp_violation = float(np.nanmax(pp_violation_log[:steps_taken])) if steps_taken > 0 else 0.0
+            metrics["max_pp_violation"] = max_pp_violation
+        else:
+            metrics["max_pp_violation"] = 0.0
+
     if not collect_logs:
         return metrics, None
 
@@ -827,12 +1048,15 @@ def rollout_once(
 
     logs = dict(
         t=t_log[:steps],
+
         theta_ref=th_ref_log[:steps],
         omega_ref=om_ref_log[:steps],
         alpha_ref=al_ref_log[:steps],
+
         theta=th_log[:steps],
         omega=om_log[:steps],
         tau_m=tau_m_log[:steps],
+
         u_rl=u_rl_log[:steps],
         u_eq=u_eq_log[:steps],
         u_s=u_s_log[:steps],
@@ -842,10 +1066,25 @@ def rollout_once(
         u_tde=u_tde_log[:steps],
         u_smc=u_smc_log[:steps],
         u_total=u_total_log[:steps],
+
         disturbance=dist_log[:steps],
         gravity=gravity_log[:steps],
+
         reference_kind=reference_kind,
         force_full_reference_duration=force_full_reference_duration,
+
+        # PP logs
+        use_pp=bool(smc_cfg.use_pp),
+        tracking_error=e_log[:steps],
+        tracking_error_dot=edot_log[:steps],
+        pp_rho=pp_rho_log[:steps],
+        pp_upper=pp_upper_log[:steps],
+        pp_lower=pp_lower_log[:steps],
+        pp_xi=pp_xi_log[:steps],
+        pp_xi_raw=pp_xi_raw_log[:steps],
+        pp_eps=pp_eps_log[:steps],
+        pp_eps_dot=pp_eps_dot_log[:steps],
+        pp_violation=pp_violation_log[:steps],
     )
 
     return metrics, logs
@@ -867,7 +1106,9 @@ def evaluate_and_rollout(trj_type: str = TRJ_TYPE) -> Dict[str, np.ndarray]:
 
 def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
     import matplotlib.pyplot as plt
+
     plant_p, _, _, _, _ = build_system_from_settings()
+
     t = logs["t"]
     theta = logs["theta"]
     theta_ref = logs["theta_ref"]
@@ -877,19 +1118,30 @@ def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
     tau_m = logs["tau_m"]
     s = logs["s"]
     d_hat = logs["d_hat"]
+
     theta0 = math.radians(THETA0_DEG)
     theta_goal = math.radians(THETA_GOAL_DEG)
     trj_type = logs.get("trj_type", logs.get("reference_kind", TRJ_TYPE))
 
+    use_pp_plot = bool(logs.get("use_pp", False)) and "pp_upper" in logs
+
     J_u = float(np.sum(u_total ** 2) * plant_p.dt)
     final_error = float(theta[-1] - theta_goal)
+
     print(f"Trajectory type = {trj_type}")
     print(f"Total rollout cost = {logs['metrics']['total_cost']:.6g}")
     print(f"Energy metric J_u = {J_u:.6g} N.m^2.s")
     print(f"Final angle error = {final_error:.6f} rad ({math.degrees(final_error):.3f} deg)")
 
-    fig, axes = plt.subplots(4, 1, sharex=True, figsize=(9, 10))
+    if use_pp_plot:
+        max_pp_violation = float(np.nanmax(logs["pp_violation"]))
+        print(f"Max PP violation = {max_pp_violation:.6g}")
+
+    nrows = 5 if use_pp_plot else 4
+
+    fig, axes = plt.subplots(nrows, 1, sharex=True, figsize=(9, 12 if use_pp_plot else 10))
     fig.suptitle(f"TDE+SMC tracking with {trj_type} reference")
+
     axes[0].plot(t, theta, label="theta")
     axes[0].plot(t, theta_ref, "--", label="theta_ref")
     axes[0].axhline(theta0, linestyle=":", label="theta0")
@@ -910,14 +1162,28 @@ def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
     axes[3].plot(t, s, label="s sliding")
     axes[3].plot(t, d_hat, label="d_hat")
     axes[3].set_ylabel("SMC/TDE")
-    axes[3].set_xlabel("Time [s]")
     axes[3].legend(loc="best")
+
+    if use_pp_plot:
+        e = logs["tracking_error"]
+        pp_upper = logs["pp_upper"]
+        pp_lower = logs["pp_lower"]
+
+        axes[4].plot(t, e, label="tracking error e = theta - theta_ref")
+        axes[4].plot(t, pp_upper, "--", label="+rho(t)")
+        axes[4].plot(t, pp_lower, "--", label="-rho(t)")
+        axes[4].axhline(0.0, linestyle=":")
+        axes[4].set_ylabel("PP error bound [rad]")
+        axes[4].set_xlabel("Time [s]")
+        axes[4].legend(loc="best")
+    else:
+        axes[3].set_xlabel("Time [s]")
 
     for ax in axes:
         ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.7)
+
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
-
 
 #%% ========================= RUN ROLLOUT =========================
 # In Spyder, run USER SETTINGS first, then run this cell.
