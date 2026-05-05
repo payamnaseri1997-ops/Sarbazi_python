@@ -40,6 +40,9 @@ import LQR_TrjOPt_TDESMCwithRLresidual as sysmod
 import true_gps_lqr_guided_addon as gps
 
 
+HOLD_FRACTION_AFTER_GOAL = gps.HOLD_FRACTION_AFTER_GOAL
+
+
 #%% ========================= CONFIG =========================
 
 @dataclass

@@ -133,6 +133,27 @@ def _shape_basis(z: np.ndarray, n_shape: int) -> np.ndarray:
     return sysmod.sin_basis(z, n_shape)
 
 
+
+HOLD_FRACTION_AFTER_GOAL = 0.25
+
+
+def _extend_reference_with_goal_hold(
+    theta_ref: np.ndarray,
+    dt: float,
+    hold_fraction: float = HOLD_FRACTION_AFTER_GOAL,
+    theta_goal: Optional[float] = None,
+) -> np.ndarray:
+    """Append a flat tail at theta_goal for a fraction of current trajectory time."""
+    theta_ref = np.asarray(theta_ref, dtype=float).reshape(-1)
+    if theta_ref.size < 2 or hold_fraction <= 0.0:
+        return theta_ref
+    hold_steps = int(round((theta_ref.size - 1) * hold_fraction))
+    if hold_steps <= 0:
+        return theta_ref
+    goal_value = float(theta_ref[-1] if theta_goal is None else theta_goal)
+    return np.r_[theta_ref, np.full(hold_steps, goal_value, dtype=float)]
+
+
 def build_monotone_reference(
     theta_goal: float,
     params: np.ndarray,
@@ -171,7 +192,10 @@ def build_monotone_reference(
     theta_ref = theta0 + delta * h
     theta_ref[0] = theta0
     theta_ref[-1] = theta_goal
+    theta_ref = _extend_reference_with_goal_hold(theta_ref, dt, theta_goal=theta_goal)
     omega_ref = sysmod.finite_diff(theta_ref, dt)
+    t = np.arange(theta_ref.size, dtype=float) * dt
+    T = float(t[-1])
     return t, theta_ref, omega_ref, T
 
 
