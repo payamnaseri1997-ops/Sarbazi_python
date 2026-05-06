@@ -8,9 +8,14 @@ This file trains/loads the SAC actor, but all plant parameters, base LQR
 trajectory, TDE+SMC rollout, and physical simulation are delegated to:
     true_gps_lqr_guided_addon.py -> LQR_TrjOPt_TDESMCwithRLresidual.py
 
-Saved model format is unchanged:
-    save_dir/sac_gps_agent.pt
-    save_dir/sac_gps_actor.pt
+Saved model format:
+    save_dir/sac_gps_agent/actor.keras
+    save_dir/sac_gps_agent/q1.keras
+    save_dir/sac_gps_agent/q2.keras
+    save_dir/sac_gps_agent/q1_t.keras
+    save_dir/sac_gps_agent/q2_t.keras
+    save_dir/sac_gps_agent/state.json
+    save_dir/sac_gps_actor.keras
     save_dir/training_history.json
     save_dir/configs.json
 """
@@ -25,16 +30,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    import torch.nn.functional as F
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
 except Exception as exc:  # pragma: no cover
-    torch = None
-    nn = optim = F = None
-    _TORCH_IMPORT_ERROR = exc
+    tf = None
+    keras = None
+    layers = None
+    _TF_IMPORT_ERROR = exc
 else:
-    _TORCH_IMPORT_ERROR = None
+    _TF_IMPORT_ERROR = None
+
+
+def _require_tensorflow() -> None:
+    if tf is None:
+        raise RuntimeError(f"TensorFlow is required for this file. TensorFlow import failed: {_TF_IMPORT_ERROR}")
+
+
+def _print_tensorflow_diagnostics() -> None:
+    _require_tensorflow()
+    print("TensorFlow version:", tf.__version__)
+    print("GPUs:", tf.config.list_physical_devices("GPU"))
 
 import LQR_TrjOPt_TDESMCwithRLresidual as sysmod
 import true_gps_lqr_guided_addon as gps
@@ -146,180 +162,186 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.size
         self.len = min(self.len + 1, self.size)
 
-    def sample(self, batch_size: int, device):
+    def sample(self, batch_size: int, device=None):
         idx = np.random.randint(0, self.len, size=int(batch_size))
         return dict(
-            obs=torch.as_tensor(self.obs[idx], dtype=torch.float32, device=device),
-            act=torch.as_tensor(self.act[idx], dtype=torch.float32, device=device),
-            rew=torch.as_tensor(self.rew[idx], dtype=torch.float32, device=device),
-            obs2=torch.as_tensor(self.obs2[idx], dtype=torch.float32, device=device),
-            done=torch.as_tensor(self.done[idx], dtype=torch.float32, device=device),
+            obs=tf.convert_to_tensor(self.obs[idx], dtype=tf.float32),
+            act=tf.convert_to_tensor(self.act[idx], dtype=tf.float32),
+            rew=tf.convert_to_tensor(self.rew[idx], dtype=tf.float32),
+            obs2=tf.convert_to_tensor(self.obs2[idx], dtype=tf.float32),
+            done=tf.convert_to_tensor(self.done[idx], dtype=tf.float32),
         )
 
 
-class MLP(nn.Module):
-    def __init__(self, inp: int, out: int, hidden_sizes: Tuple[int, ...], activation=nn.ReLU):
-        super().__init__()
-        layers: List[nn.Module] = []
-        last = inp
-        for h in hidden_sizes:
-            layers += [nn.Linear(last, h), activation()]
-            last = h
-        layers.append(nn.Linear(last, out))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
+def build_mlp(inp: int, out: int, hidden_sizes: Tuple[int, ...], activation: str = "relu", name: str = "mlp"):
+    _require_tensorflow()
+    inputs = keras.Input(shape=(int(inp),), dtype=tf.float32, name=f"{name}_input")
+    x = inputs
+    for i, h in enumerate(hidden_sizes):
+        x = layers.Dense(int(h), activation=activation, name=f"{name}_hidden_{i}")(x)
+    outputs = layers.Dense(int(out), activation=None, name=f"{name}_output")(x)
+    return keras.Model(inputs=inputs, outputs=outputs, name=name)
 
 
-class SquashedGaussianActor(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: Tuple[int, ...]):
-        super().__init__()
-        self.net = MLP(obs_dim, 2 * act_dim, hidden_sizes)
+MLP = build_mlp
+
+
+class SquashedGaussianActor(keras.Model if keras is not None else object):
+    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: Tuple[int, ...], name: str = "squashed_gaussian_actor"):
+        _require_tensorflow()
+        super().__init__(name=name)
+        self.act_dim = int(act_dim)
+        self.net = build_mlp(obs_dim, 2 * act_dim, hidden_sizes, activation="relu", name="actor_mlp")
         self.log_std_min = -5.0
         self.log_std_max = 1.0
 
-    def forward(self, obs, deterministic: bool = False, with_logprob: bool = True):
-        mu_logstd = self.net(obs)
-        mu, log_std = torch.chunk(mu_logstd, 2, dim=-1)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
-        dist = torch.distributions.Normal(mu, std)
-        z = mu if deterministic else dist.rsample()
-        action = torch.tanh(z)
+    def call(self, obs, training: bool = False):
+        return self.net(obs, training=training)
+
+    def forward(self, obs, deterministic: bool = False, with_logprob: bool = True, training: bool = False):
+        mu_logstd = self.net(obs, training=training)
+        mu, log_std = tf.split(mu_logstd, 2, axis=-1)
+        log_std = tf.clip_by_value(log_std, self.log_std_min, self.log_std_max)
+        std = tf.exp(log_std)
+        z = mu if deterministic else mu + std * tf.random.normal(tf.shape(mu), dtype=mu.dtype)
+        action = tf.tanh(z)
         if with_logprob:
-            logp = dist.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)
-            logp = logp.sum(dim=-1, keepdim=True)
+            logp = -0.5 * (tf.square((z - mu) / (std + 1e-8)) + 2.0 * log_std + tf.math.log(2.0 * math.pi))
+            logp = logp - tf.math.log(1.0 - tf.square(action) + 1e-6)
+            logp = tf.reduce_sum(logp, axis=-1, keepdims=True)
         else:
             logp = None
-        return action, logp, torch.tanh(mu)
+        return action, logp, tf.tanh(mu)
 
 
-class Critic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: Tuple[int, ...]):
-        super().__init__()
-        self.q = MLP(obs_dim + act_dim, 1, hidden_sizes)
 
-    def forward(self, obs, act):
-        return self.q(torch.cat([obs, act], dim=-1))
+class Critic(keras.Model if keras is not None else object):
+    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes: Tuple[int, ...], name: str = "critic"):
+        _require_tensorflow()
+        super().__init__(name=name)
+        self.q = build_mlp(obs_dim + act_dim, 1, hidden_sizes, activation="relu", name=f"{name}_mlp")
+
+    def call(self, inputs, training: bool = False):
+        obs, act = inputs
+        return self.forward(obs, act, training=training)
+
+    def forward(self, obs, act, training: bool = False):
+        return self.q(tf.concat([obs, act], axis=-1), training=training)
 
 
 class SACGPSAgent:
     def __init__(self, obs_dim: int, act_dim: int, cfg: SACGPSConfig):
-        if torch is None:
-            raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
+        _require_tensorflow()
         self.cfg = cfg
-        self.device = torch.device("cpu")
-        self.actor = SquashedGaussianActor(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
-        self.q1 = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
-        self.q2 = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
-        self.q1_t = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
-        self.q2_t = Critic(obs_dim, act_dim, cfg.hidden_sizes).to(self.device)
-        self.q1_t.load_state_dict(self.q1.state_dict())
-        self.q2_t.load_state_dict(self.q2.state_dict())
-        self.pi_opt = optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
-        self.q1_opt = optim.Adam(self.q1.parameters(), lr=cfg.critic_lr)
-        self.q2_opt = optim.Adam(self.q2.parameters(), lr=cfg.critic_lr)
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(act_dim)
+        self.actor = SquashedGaussianActor(obs_dim, act_dim, cfg.hidden_sizes)
+        self.q1 = Critic(obs_dim, act_dim, cfg.hidden_sizes, name="q1")
+        self.q2 = Critic(obs_dim, act_dim, cfg.hidden_sizes, name="q2")
+        self.q1_t = Critic(obs_dim, act_dim, cfg.hidden_sizes, name="q1_t")
+        self.q2_t = Critic(obs_dim, act_dim, cfg.hidden_sizes, name="q2_t")
+        dummy_obs = tf.zeros((1, obs_dim), dtype=tf.float32)
+        dummy_act = tf.zeros((1, act_dim), dtype=tf.float32)
+        self.actor.forward(dummy_obs, deterministic=True, with_logprob=False)
+        self.q1.forward(dummy_obs, dummy_act); self.q2.forward(dummy_obs, dummy_act)
+        self.q1_t.forward(dummy_obs, dummy_act); self.q2_t.forward(dummy_obs, dummy_act)
+        self.q1_t.set_weights(self.q1.get_weights())
+        self.q2_t.set_weights(self.q2.get_weights())
+        self.pi_opt = tf.keras.optimizers.Adam(learning_rate=cfg.actor_lr)
+        self.q1_opt = tf.keras.optimizers.Adam(learning_rate=cfg.critic_lr)
+        self.q2_opt = tf.keras.optimizers.Adam(learning_rate=cfg.critic_lr)
         self.replay = ReplayBuffer(obs_dim, act_dim, cfg.replay_size)
         self.total_interactions = 0
-        if cfg.autotune_alpha:
-            self.log_alpha = torch.tensor(math.log(cfg.alpha_init), dtype=torch.float32, requires_grad=True, device=self.device)
-            self.alpha_opt = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
-            self.target_entropy = -float(act_dim) * cfg.target_entropy_scale
-        else:
-            self.log_alpha = torch.tensor(math.log(cfg.alpha_init), dtype=torch.float32, requires_grad=False, device=self.device)
-            self.alpha_opt = None
-            self.target_entropy = None
+        self.log_alpha = tf.Variable(math.log(cfg.alpha_init), dtype=tf.float32, trainable=bool(cfg.autotune_alpha), name="log_alpha")
+        self.alpha_opt = tf.keras.optimizers.Adam(learning_rate=cfg.alpha_lr) if cfg.autotune_alpha else None
+        self.target_entropy = -float(act_dim) * cfg.target_entropy_scale if cfg.autotune_alpha else None
 
     @property
     def alpha(self):
-        return self.log_alpha.exp()
+        return tf.exp(self.log_alpha)
 
     def act(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            a, _, mu = self.actor(obs_t, deterministic=deterministic, with_logprob=False)
-            out = mu if deterministic else a
-        return out.squeeze(0).cpu().numpy().astype(np.float32)
+        obs_t = tf.convert_to_tensor(np.asarray(obs, dtype=np.float32)[None, :], dtype=tf.float32)
+        a, _, mu = self.actor.forward(obs_t, deterministic=deterministic, with_logprob=False, training=False)
+        out = mu if deterministic else a
+        return out.numpy().squeeze(0).astype(np.float32)
 
     def update(self, n_updates: int = 1) -> Dict[str, float]:
         if self.replay.len < self.cfg.batch_size:
             return {}
         logs: Dict[str, float] = {}
         for _ in range(int(n_updates)):
-            batch = self.replay.sample(self.cfg.batch_size, self.device)
+            batch = self.replay.sample(self.cfg.batch_size)
             obs, act, rew, obs2, done = batch["obs"], batch["act"], batch["rew"], batch["obs2"], batch["done"]
             alpha = self.alpha
-            with torch.no_grad():
-                a2, logp2, _ = self.actor(obs2, deterministic=False, with_logprob=True)
-                q_t = torch.min(self.q1_t(obs2, a2), self.q2_t(obs2, a2)) - alpha * logp2
-                backup = rew + self.cfg.gamma * (1.0 - done) * q_t
-            q1_loss = F.mse_loss(self.q1(obs, act), backup)
-            q2_loss = F.mse_loss(self.q2(obs, act), backup)
-            self.q1_opt.zero_grad(); q1_loss.backward(); self.q1_opt.step()
-            self.q2_opt.zero_grad(); q2_loss.backward(); self.q2_opt.step()
-            a_pi, logp_pi, _ = self.actor(obs, deterministic=False, with_logprob=True)
-            q_pi = torch.min(self.q1(obs, a_pi), self.q2(obs, a_pi))
-            pi_loss = (alpha.detach() * logp_pi - q_pi).mean()
-            self.pi_opt.zero_grad(); pi_loss.backward(); self.pi_opt.step()
+            a2, logp2, _ = self.actor.forward(obs2, deterministic=False, with_logprob=True, training=False)
+            q_t = tf.minimum(self.q1_t.forward(obs2, a2, training=False), self.q2_t.forward(obs2, a2, training=False)) - alpha * logp2
+            backup = tf.stop_gradient(rew + self.cfg.gamma * (1.0 - done) * q_t)
+            with tf.GradientTape() as tape:
+                q1_pred = self.q1.forward(obs, act, training=True)
+                q1_loss = tf.reduce_mean(tf.square(q1_pred - backup))
+            self.q1_opt.apply_gradients(zip(tape.gradient(q1_loss, self.q1.trainable_variables), self.q1.trainable_variables))
+            with tf.GradientTape() as tape:
+                q2_pred = self.q2.forward(obs, act, training=True)
+                q2_loss = tf.reduce_mean(tf.square(q2_pred - backup))
+            self.q2_opt.apply_gradients(zip(tape.gradient(q2_loss, self.q2.trainable_variables), self.q2.trainable_variables))
+            with tf.GradientTape() as tape:
+                a_pi, logp_pi, _ = self.actor.forward(obs, deterministic=False, with_logprob=True, training=True)
+                q_pi = tf.minimum(self.q1.forward(obs, a_pi, training=False), self.q2.forward(obs, a_pi, training=False))
+                pi_loss = tf.reduce_mean(tf.stop_gradient(alpha) * logp_pi - q_pi)
+            self.pi_opt.apply_gradients(zip(tape.gradient(pi_loss, self.actor.trainable_variables), self.actor.trainable_variables))
             if self.alpha_opt is not None:
-                alpha_loss = (-self.log_alpha * (logp_pi + self.target_entropy).detach()).mean()
-                self.alpha_opt.zero_grad(); alpha_loss.backward(); self.alpha_opt.step()
+                with tf.GradientTape() as tape:
+                    alpha_loss = tf.reduce_mean(-self.log_alpha * tf.stop_gradient(logp_pi + self.target_entropy))
+                self.alpha_opt.apply_gradients([(tape.gradient(alpha_loss, self.log_alpha), self.log_alpha)])
             else:
-                alpha_loss = torch.tensor(0.0)
-            with torch.no_grad():
-                for p, pt in zip(self.q1.parameters(), self.q1_t.parameters()):
-                    pt.data.mul_(1.0 - self.cfg.tau).add_(self.cfg.tau * p.data)
-                for p, pt in zip(self.q2.parameters(), self.q2_t.parameters()):
-                    pt.data.mul_(1.0 - self.cfg.tau).add_(self.cfg.tau * p.data)
-            logs = dict(q1_loss=float(q1_loss.detach().cpu().item()), q2_loss=float(q2_loss.detach().cpu().item()), pi_loss=float(pi_loss.detach().cpu().item()), alpha=float(self.alpha.detach().cpu().item()), alpha_loss=float(alpha_loss.detach().cpu().item()))
+                alpha_loss = tf.constant(0.0, dtype=tf.float32)
+            for online, target in ((self.q1, self.q1_t), (self.q2, self.q2_t)):
+                for w, wt in zip(online.weights, target.weights):
+                    wt.assign((1.0 - self.cfg.tau) * wt + self.cfg.tau * w)
+            logs = dict(q1_loss=float(q1_loss.numpy()), q2_loss=float(q2_loss.numpy()), pi_loss=float(pi_loss.numpy()), alpha=float(self.alpha.numpy()), alpha_loss=float(alpha_loss.numpy()))
         return logs
 
     def behavior_clone(self, obs_arr: np.ndarray, act_arr: np.ndarray, epochs: int, lr: float) -> List[float]:
         if epochs <= 0 or len(obs_arr) == 0:
             return []
-        opt = optim.Adam(self.actor.parameters(), lr=lr)
-        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
-        act_t = torch.as_tensor(act_arr, dtype=torch.float32, device=self.device)
+        opt = tf.keras.optimizers.Adam(learning_rate=lr)
+        obs_t = tf.convert_to_tensor(obs_arr, dtype=tf.float32)
+        act_t = tf.convert_to_tensor(act_arr, dtype=tf.float32)
         losses: List[float] = []
         for ep in range(int(epochs)):
-            _, _, mu = self.actor(obs_t, deterministic=True, with_logprob=False)
-            loss = F.mse_loss(mu, act_t)
-            opt.zero_grad(); loss.backward(); opt.step()
-            losses.append(float(loss.detach().cpu().item()))
+            with tf.GradientTape() as tape:
+                _, _, mu = self.actor.forward(obs_t, deterministic=True, with_logprob=False, training=True)
+                loss = tf.reduce_mean(tf.square(mu - act_t))
+            opt.apply_gradients(zip(tape.gradient(loss, self.actor.trainable_variables), self.actor.trainable_variables))
+            losses.append(float(loss.numpy()))
             if (ep + 1) % max(1, epochs // 4) == 0:
                 print(f"behavior clone {ep+1}/{epochs}: loss={losses[-1]:.6g}")
         return losses
 
     def save(self, path: str):
-        mkdir(os.path.dirname(path) or ".")
-        torch.save(
-            dict(
-                actor=self.actor.state_dict(),
-                q1=self.q1.state_dict(),
-                q2=self.q2.state_dict(),
-                q1_t=self.q1_t.state_dict(),
-                q2_t=self.q2_t.state_dict(),
-                log_alpha=float(self.log_alpha.detach().cpu().item()),
-                cfg=asdict(self.cfg),
-                total_interactions=int(self.total_interactions),
-                replay_resumed=False,
-                replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer.",
-            ),
-            path,
-        )
+        mkdir(path)
+        self.actor.net.save(os.path.join(path, "actor.keras"))
+        self.q1.q.save(os.path.join(path, "q1.keras"))
+        self.q2.q.save(os.path.join(path, "q2.keras"))
+        self.q1_t.q.save(os.path.join(path, "q1_t.keras"))
+        self.q2_t.q.save(os.path.join(path, "q2_t.keras"))
+        with open(os.path.join(path, "state.json"), "w") as f:
+            json.dump(dict(log_alpha=float(self.log_alpha.numpy()), cfg=asdict(self.cfg), total_interactions=int(self.total_interactions), replay_resumed=False, replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer."), f, indent=2)
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(ckpt["actor"])
-        self.q1.load_state_dict(ckpt["q1"])
-        self.q2.load_state_dict(ckpt["q2"])
-        self.q1_t.load_state_dict(ckpt.get("q1_t", ckpt["q1"]))
-        self.q2_t.load_state_dict(ckpt.get("q2_t", ckpt["q2"]))
-        if "log_alpha" in ckpt:
-            with torch.no_grad():
-                self.log_alpha.copy_(torch.tensor(float(ckpt["log_alpha"]), dtype=torch.float32, device=self.device))
-        self.total_interactions = int(ckpt.get("total_interactions", self.total_interactions))
+        self.actor.net = keras.models.load_model(os.path.join(path, "actor.keras"))
+        self.q1.q = keras.models.load_model(os.path.join(path, "q1.keras"))
+        self.q2.q = keras.models.load_model(os.path.join(path, "q2.keras"))
+        self.q1_t.q = keras.models.load_model(os.path.join(path, "q1_t.keras"))
+        self.q2_t.q = keras.models.load_model(os.path.join(path, "q2_t.keras"))
+        state_path = os.path.join(path, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, "r") as f:
+                ckpt = json.load(f)
+            if "log_alpha" in ckpt:
+                self.log_alpha.assign(float(ckpt["log_alpha"]))
+            self.total_interactions = int(ckpt.get("total_interactions", self.total_interactions))
         print(f"Loaded SAC-GPS agent from: {path}")
 
 
@@ -360,18 +382,18 @@ def evaluate_action(case, action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, se
 def critic_refine_action(agent: SACGPSAgent, obs: np.ndarray, action_init: np.ndarray, steps: int, lr: float, l2: float) -> np.ndarray:
     if steps <= 0:
         return np.asarray(action_init, dtype=np.float32)
-    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=agent.device).unsqueeze(0)
+    obs_t = tf.convert_to_tensor(np.asarray(obs, dtype=np.float32)[None, :], dtype=tf.float32)
     a0 = np.clip(np.asarray(action_init, dtype=np.float32), -0.999, 0.999)
-    y = torch.tensor(np.arctanh(a0), dtype=torch.float32, device=agent.device, requires_grad=True)
-    opt = optim.Adam([y], lr=lr)
-    a0_t = torch.as_tensor(a0, dtype=torch.float32, device=agent.device).unsqueeze(0)
+    y = tf.Variable(np.arctanh(a0), dtype=tf.float32)
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+    a0_t = tf.convert_to_tensor(a0[None, :], dtype=tf.float32)
     for _ in range(int(steps)):
-        a = torch.tanh(y).unsqueeze(0)
-        q = torch.min(agent.q1(obs_t, a), agent.q2(obs_t, a))
-        loss = -(q.mean() - l2 * torch.mean((a - a0_t) ** 2))
-        opt.zero_grad(); loss.backward(); opt.step()
-    with torch.no_grad():
-        return torch.tanh(y).cpu().numpy().astype(np.float32)
+        with tf.GradientTape() as tape:
+            a = tf.tanh(y)[None, :]
+            q = tf.minimum(agent.q1.forward(obs_t, a, training=False), agent.q2.forward(obs_t, a, training=False))
+            loss = -(tf.reduce_mean(q) - l2 * tf.reduce_mean(tf.square(a - a0_t)))
+        opt.apply_gradients([(tape.gradient(loss, y), y)])
+    return tf.tanh(y).numpy().astype(np.float32)
 
 
 #%% ========================= TEACHERS / TRAINING =========================
@@ -499,16 +521,15 @@ def _case_to_dict(case: gps.GPSCase) -> Dict[str, float]:
 
 
 def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=1000, teacher_cem_iters=4, teacher_population=20, eval_every=50, seed=0, save_dir=None, use_saved_teacher_summary=True, allow_fresh_cem_teachers=False, resume_training=False, skip_existing_cases=False):
-    if torch is None:
-        raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
+    _print_tensorflow_diagnostics()
     mkdir(save_dir)
     rng = np.random.default_rng(seed)
-    torch.manual_seed(seed); np.random.seed(seed)
+    tf.random.set_seed(seed); np.random.seed(seed)
     agent = SACGPSAgent(obs_dim=3, act_dim=traj_cfg.n_basis + 1, cfg=sac_cfg)
     baseline_cache = BaselineCache(obj_cfg)
     history = _load_history_if_available(save_dir)
     teacher_output = None
-    checkpoint_path = os.path.join(save_dir, "sac_gps_agent.pt") if save_dir else "sac_gps_agent.pt"
+    checkpoint_path = os.path.join(save_dir, "sac_gps_agent") if save_dir else "sac_gps_agent"
     agent_loaded = False
 
     if resume_training:
@@ -561,7 +582,7 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
                 mean_existing = float(np.mean([r["existing_metrics"]["total_cost"] for r in eval_rows]))
                 mean_actor = float(np.mean([r["actor_eval"]["cost"] for r in eval_rows]))
                 mean_imp = 100.0 * (mean_existing - mean_actor) / max(abs(mean_existing), 1e-12)
-                rec = dict(record_type="step", step=step, total_interactions=int(agent.total_interactions), train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.detach().cpu().item()))
+                rec = dict(record_type="step", step=step, total_interactions=int(agent.total_interactions), train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.numpy()))
                 rec.update({k: float(v) for k, v in upd.items()})
                 history.append(rec)
                 print(f"SAC-GPS step {step:05d}/{total_interactions}: train_reward={ev['reward']:.4f}, actor_eval={mean_actor:.6g}, existing_eval={mean_existing:.6g}, improvement={mean_imp:.2f}%, buffer={agent.replay.len}")
@@ -584,11 +605,11 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
     )
 
     if save_dir:
-        agent_path = os.path.join(save_dir, "sac_gps_agent.pt")
-        actor_path = os.path.join(save_dir, "sac_gps_actor.pt")
+        agent_path = os.path.join(save_dir, "sac_gps_agent")
+        actor_path = os.path.join(save_dir, "sac_gps_actor.keras")
         run_record["model_path"] = agent_path
         agent.save(agent_path)
-        torch.save(agent.actor.state_dict(), actor_path)
+        agent.actor.net.save(actor_path)
         with open(os.path.join(save_dir, "configs.json"), "w") as f:
             json.dump(dict(sac_cfg=asdict(sac_cfg), traj_cfg=asdict(traj_cfg), obj_cfg=asdict(obj_cfg)), f, indent=2)
         latest_path = os.path.join(save_dir, "latest_run_config.json")
@@ -703,4 +724,4 @@ if __name__ == "__main__":
     results = dict(agent=agent, train_output=train_output, eval_rows=rows, train_cases=train_cases, test_cases=test_cases, traj_cfg=traj_cfg, obj_cfg=obj_cfg, sac_cfg=sac_cfg, save_dir=save_dir)
     print("\nDone. Results are stored in variable: results")
     print(f"Saved outputs to: {save_dir}")
-    # Example resume: set resume_training=True to continue from sac_gps_agent.pt.
+    # Example resume: set resume_training=True to continue from sac_gps_agent.

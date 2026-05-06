@@ -10,9 +10,11 @@ LQR_TrjOPt_TDESMCwithRLresidual.py for:
     - base LQR trajectory
     - TDE+SMC rollout and control command generation
 
-Saved files are unchanged:
-    save_dir/true_gps_policy.pt
+Saved files:
+    save_dir/true_gps_policy.keras
     save_dir/training_teachers.json
+    save_dir/training_history.json
+    save_dir/latest_run_config.json
 """
 
 from __future__ import annotations
@@ -25,16 +27,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
 except Exception as exc:  # pragma: no cover
-    torch = None
-    nn = None
-    optim = None
-    _TORCH_IMPORT_ERROR = exc
+    tf = None
+    keras = None
+    layers = None
+    _TF_IMPORT_ERROR = exc
 else:
-    _TORCH_IMPORT_ERROR = None
+    _TF_IMPORT_ERROR = None
+
+
+def _require_tensorflow() -> None:
+    if tf is None:
+        raise RuntimeError(f"TensorFlow is required for this file. TensorFlow import failed: {_TF_IMPORT_ERROR}")
+
+
+def _print_tensorflow_diagnostics() -> None:
+    _require_tensorflow()
+    print("TensorFlow version:", tf.__version__)
+    print("GPUs:", tf.config.list_physical_devices("GPU"))
 
 import LQR_TrjOPt_TDESMCwithRLresidual as sysmod
 
@@ -418,21 +431,17 @@ def cem_optimize_guided_case(
 
 #%% ========================= GLOBAL POLICY =========================
 
-class GuidedTrajectoryPolicy(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, hidden_sizes: Tuple[int, int]):
-        if torch is None:
-            raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
-        super().__init__()
-        layers: List[nn.Module] = []
-        last = input_dim
-        for h in hidden_sizes:
-            layers.append(nn.Linear(last, h)); layers.append(nn.Tanh()); last = h
-        layers.append(nn.Linear(last, output_dim))
-        self.net = nn.Sequential(*layers)
+GuidedTrajectoryPolicy = keras.Model if keras is not None else object
 
-    def forward(self, x):
-        return self.net(x)
 
+def build_guided_trajectory_policy(input_dim: int, output_dim: int, hidden_sizes: Tuple[int, int]):
+    _require_tensorflow()
+    inputs = keras.Input(shape=(int(input_dim),), dtype=tf.float32, name="case_features")
+    x = inputs
+    for i, h in enumerate(hidden_sizes):
+        x = layers.Dense(int(h), activation="tanh", name=f"hidden_{i}")(x)
+    outputs = layers.Dense(int(output_dim), activation=None, name="residual_params")(x)
+    return keras.Model(inputs=inputs, outputs=outputs, name="guided_trajectory_policy")
 
 def case_features(case: GPSCase) -> np.ndarray:
     max_tilt = math.radians(float(sysmod.RL_MAX_TILT_DEG))
@@ -447,33 +456,37 @@ def train_policy_from_local_teachers(
     seed: int = 0,
     policy: Optional[GuidedTrajectoryPolicy] = None,
 ):
-    if torch is None:
-        raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
-    torch.manual_seed(seed); np.random.seed(seed)
+    _print_tensorflow_diagnostics()
+    tf.random.set_seed(seed); np.random.seed(seed)
     X, Y = [], []
     for res in local_results:
         X.append(case_features(res["case"]))
         Y.append(np.asarray(res["best"]["params"], dtype=np.float32))
-    X_t = torch.as_tensor(np.stack(X, axis=0), dtype=torch.float32)
-    Y_t = torch.as_tensor(np.stack(Y, axis=0), dtype=torch.float32)
+    X_t = tf.convert_to_tensor(np.stack(X, axis=0), dtype=tf.float32)
+    Y_t = tf.convert_to_tensor(np.stack(Y, axis=0), dtype=tf.float32)
     if policy is None:
-        policy = GuidedTrajectoryPolicy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
-    opt = optim.Adam(policy.parameters(), lr=lr, weight_decay=1e-5)
+        policy = build_guided_trajectory_policy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+    l2_weight = 1e-5
     losses = []
     for ep in range(int(epochs)):
-        pred = policy(X_t)
-        loss = torch.mean((pred - Y_t) ** 2)
-        opt.zero_grad(); loss.backward(); opt.step()
-        losses.append(float(loss.detach().cpu().item()))
+        with tf.GradientTape() as tape:
+            pred = policy(X_t, training=True)
+            mse = tf.reduce_mean(tf.square(pred - Y_t))
+            l2 = tf.add_n([tf.reduce_sum(tf.square(v)) for v in policy.trainable_variables]) if policy.trainable_variables else 0.0
+            loss = mse + l2_weight * l2
+        grads = tape.gradient(loss, policy.trainable_variables)
+        opt.apply_gradients(zip(grads, policy.trainable_variables))
+        losses.append(float(loss.numpy()))
         if (ep + 1) % max(1, epochs // 5) == 0:
             print(f"policy imitation epoch {ep+1}/{epochs}: loss={losses[-1]:.6g}")
     return policy, losses
 
 
 def policy_predict_params(policy: GuidedTrajectoryPolicy, case: GPSCase) -> np.ndarray:
-    x = torch.as_tensor(case_features(case), dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
-        return policy(x).squeeze(0).cpu().numpy().astype(float)
+    _require_tensorflow()
+    x = tf.convert_to_tensor(case_features(case)[None, :], dtype=tf.float32)
+    return policy(x, training=False).numpy().squeeze(0).astype(float)
 
 
 
@@ -520,9 +533,10 @@ def _teacher_row_from_result(result: Dict[str, object]) -> Dict[str, object]:
 
 
 def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajectoryConfig, obj_cfg: GPSObjectiveConfig, cem_iters: int = 10, population: int = 48, elite_frac: float = 0.20, policy_epochs: int = 1500, seed: int = 0, save_dir: Optional[str] = None, resume_training: bool = False, skip_existing_cases: bool = False):
+    _print_tensorflow_diagnostics()
     mkdir(save_dir)
     timestamp = str(np.datetime64("now"))
-    model_path = _model_path(save_dir or ".", "true_gps_policy.pt")
+    model_path = _model_path(save_dir or ".", "true_gps_policy.keras")
     teachers_path = _model_path(save_dir or ".", "training_teachers.json")
     if resume_training:
         if os.path.exists(model_path):
@@ -544,16 +558,14 @@ def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajector
         res = cem_optimize_guided_case(case, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=elite_frac, seed=seed + 100 * i)
         local_results.append(res)
 
-    policy = GuidedTrajectoryPolicy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
-    if resume_training:
-        policy.load_state_dict(torch.load(model_path, map_location="cpu"))
+    policy = keras.models.load_model(model_path) if resume_training else build_guided_trajectory_policy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
     if local_results:
         policy, losses = train_policy_from_local_teachers(local_results, traj_cfg, epochs=policy_epochs, seed=seed, policy=policy)
     else:
         losses = []
 
     if save_dir:
-        torch.save(policy.state_dict(), model_path)
+        policy.save(model_path)
         print(f"Saved model to: {model_path}")
         combined_teachers = list(prior_teacher_rows) if skip_existing_cases else []
         seen = {_teacher_row_key(r) for r in combined_teachers}
@@ -673,4 +685,4 @@ if __name__ == "__main__":
         show_plots=True,
         resume_training=False,
     )
-    # Example resume: set resume_training=True to continue from true_gps_policy.pt.
+    # Example resume: set resume_training=True to continue from true_gps_policy.keras.
