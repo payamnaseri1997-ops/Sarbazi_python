@@ -439,7 +439,14 @@ def case_features(case: GPSCase) -> np.ndarray:
     return np.array([case.theta_goal / math.pi, case.alpha / max_tilt, case.phi / max_tilt], dtype=np.float32)
 
 
-def train_policy_from_local_teachers(local_results: Sequence[Dict[str, object]], traj_cfg: GPSTrajectoryConfig, epochs: int = 1500, lr: float = 1e-3, seed: int = 0):
+def train_policy_from_local_teachers(
+    local_results: Sequence[Dict[str, object]],
+    traj_cfg: GPSTrajectoryConfig,
+    epochs: int = 1500,
+    lr: float = 1e-3,
+    seed: int = 0,
+    policy: Optional[GuidedTrajectoryPolicy] = None,
+):
     if torch is None:
         raise RuntimeError(f"PyTorch import failed: {_TORCH_IMPORT_ERROR}")
     torch.manual_seed(seed); np.random.seed(seed)
@@ -449,7 +456,8 @@ def train_policy_from_local_teachers(local_results: Sequence[Dict[str, object]],
         Y.append(np.asarray(res["best"]["params"], dtype=np.float32))
     X_t = torch.as_tensor(np.stack(X, axis=0), dtype=torch.float32)
     Y_t = torch.as_tensor(np.stack(Y, axis=0), dtype=torch.float32)
-    policy = GuidedTrajectoryPolicy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
+    if policy is None:
+        policy = GuidedTrajectoryPolicy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
     opt = optim.Adam(policy.parameters(), lr=lr, weight_decay=1e-5)
     losses = []
     for ep in range(int(epochs)):
@@ -488,6 +496,29 @@ def _load_training_history(save_dir: str) -> List[Dict[str, object]]:
     with open(path, "r") as f:
         return json.load(f)
 
+
+def _load_training_teachers(teachers_path: str) -> List[Dict[str, object]]:
+    if not os.path.exists(teachers_path):
+        return []
+    with open(teachers_path, "r") as f:
+        return json.load(f)
+
+
+def _teacher_row_key(row: Dict[str, object]) -> str:
+    return f"{float(row['theta_goal_deg']):.6f}|{float(row['alpha_deg']):.6f}|{float(row['phi_deg']):.6f}"
+
+
+def _teacher_row_from_result(result: Dict[str, object]) -> Dict[str, object]:
+    case = result["case"]
+    return dict(
+        theta_goal_deg=float(case.theta_goal_deg),
+        alpha_deg=float(case.alpha_deg),
+        phi_deg=float(case.phi_deg),
+        best_cost=float(result["best"]["cost"]),
+        best_params=np.asarray(result["best"]["params"], dtype=float).tolist(),
+    )
+
+
 def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajectoryConfig, obj_cfg: GPSObjectiveConfig, cem_iters: int = 10, population: int = 48, elite_frac: float = 0.20, policy_epochs: int = 1500, seed: int = 0, save_dir: Optional[str] = None, resume_training: bool = False, skip_existing_cases: bool = False):
     mkdir(save_dir)
     timestamp = str(np.datetime64("now"))
@@ -500,31 +531,41 @@ def train_true_gps_policy(train_cases: Sequence[GPSCase], traj_cfg: GPSTrajector
             raise FileNotFoundError(f"resume_training=True but no saved model found at: {model_path}")
     else:
         print("Starting training from scratch")
-    prior_keys = set()
-    if os.path.exists(teachers_path):
-        with open(teachers_path, "r") as f:
-            for r in json.load(f):
-                prior_keys.add(f"{float(r['theta_goal_deg']):.6f}|{float(r['alpha_deg']):.6f}|{float(r['phi_deg']):.6f}")
+
+    prior_teacher_rows = _load_training_teachers(teachers_path)
+    prior_keys = {_teacher_row_key(r) for r in prior_teacher_rows}
     selected_cases, skipped_cases = [], []
     for c in train_cases:
         (skipped_cases if skip_existing_cases and _case_key(c) in prior_keys else selected_cases).append(c)
+
     local_results = []
     for i, case in enumerate(selected_cases):
         print(f"\n=== Local GPS teacher {i+1}/{len(selected_cases)}: {case.label()} ===")
         res = cem_optimize_guided_case(case, traj_cfg, obj_cfg, cem_iters=cem_iters, population=population, elite_frac=elite_frac, seed=seed + 100 * i)
         local_results.append(res)
-    policy = GuidedTrajectoryPolicy(traj_cfg)
+
+    policy = GuidedTrajectoryPolicy(3, traj_cfg.n_basis + 1, traj_cfg.hidden_sizes)
     if resume_training:
         policy.load_state_dict(torch.load(model_path, map_location="cpu"))
     if local_results:
-        policy, losses = train_policy_from_local_teachers(local_results, traj_cfg, epochs=policy_epochs, seed=seed)
+        policy, losses = train_policy_from_local_teachers(local_results, traj_cfg, epochs=policy_epochs, seed=seed, policy=policy)
     else:
         losses = []
+
     if save_dir:
         torch.save(policy.state_dict(), model_path)
         print(f"Saved model to: {model_path}")
+        combined_teachers = list(prior_teacher_rows) if skip_existing_cases else []
+        seen = {_teacher_row_key(r) for r in combined_teachers}
+        for result in local_results:
+            row = _teacher_row_from_result(result)
+            key = _teacher_row_key(row)
+            if key in seen:
+                combined_teachers = [r for r in combined_teachers if _teacher_row_key(r) != key]
+            combined_teachers.append(row)
+            seen.add(key)
         with open(teachers_path, "w") as f:
-            json.dump([dict(theta_goal_deg=r["case"].theta_goal_deg, alpha_deg=r["case"].alpha_deg, phi_deg=r["case"].phi_deg, best_cost=r["best"]["cost"], best_params=np.asarray(r["best"]["params"]).tolist()) for r in local_results], f, indent=2)
+            json.dump(combined_teachers, f, indent=2)
         run_record = dict(timestamp=timestamp, resume_training=bool(resume_training), skip_existing_cases=bool(skip_existing_cases), cem_iters=int(cem_iters), population=int(population), policy_epochs=int(policy_epochs), model_path=model_path, trained_cases_this_run=[_case_to_dict(c) for c in selected_cases], skipped_cases=[_case_to_dict(c) for c in skipped_cases])
         hist = _load_training_history(save_dir); hist.append(run_record)
         with open(_model_path(save_dir, "training_history.json"), "w") as f:

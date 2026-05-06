@@ -293,7 +293,21 @@ class SACGPSAgent:
 
     def save(self, path: str):
         mkdir(os.path.dirname(path) or ".")
-        torch.save(dict(actor=self.actor.state_dict(), q1=self.q1.state_dict(), q2=self.q2.state_dict(), q1_t=self.q1_t.state_dict(), q2_t=self.q2_t.state_dict(), log_alpha=float(self.log_alpha.detach().cpu().item()), cfg=asdict(self.cfg)), path)
+        torch.save(
+            dict(
+                actor=self.actor.state_dict(),
+                q1=self.q1.state_dict(),
+                q2=self.q2.state_dict(),
+                q1_t=self.q1_t.state_dict(),
+                q2_t=self.q2_t.state_dict(),
+                log_alpha=float(self.log_alpha.detach().cpu().item()),
+                cfg=asdict(self.cfg),
+                total_interactions=int(self.total_interactions),
+                replay_resumed=False,
+                replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer.",
+            ),
+            path,
+        )
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
@@ -305,6 +319,7 @@ class SACGPSAgent:
         if "log_alpha" in ckpt:
             with torch.no_grad():
                 self.log_alpha.copy_(torch.tensor(float(ckpt["log_alpha"]), dtype=torch.float32, device=self.device))
+        self.total_interactions = int(ckpt.get("total_interactions", self.total_interactions))
         print(f"Loaded SAC-GPS agent from: {path}")
 
 
@@ -443,7 +458,7 @@ def prefill_with_gps_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, ba
     return dict(rows=rows, bc_losses=bc_losses, loaded_from="fresh_cem")
 
 
-def _load_history_if_available(save_dir: Optional[str]) -> List[Dict[str, float]]:
+def _load_history_if_available(save_dir: Optional[str]) -> List[Dict[str, object]]:
     if not save_dir:
         return []
     path = os.path.join(save_dir, "training_history.json")
@@ -453,6 +468,26 @@ def _load_history_if_available(save_dir: Optional[str]) -> List[Dict[str, float]
         hist = json.load(f)
     print(f"Loaded existing training history with {len(hist)} records from: {path}")
     return hist
+
+
+def _history_path(save_dir: Optional[str]) -> Optional[str]:
+    return os.path.join(save_dir, "training_history.json") if save_dir else None
+
+
+def _save_history(save_dir: Optional[str], history: Sequence[Dict[str, object]]) -> None:
+    path = _history_path(save_dir)
+    if not path:
+        return
+    with open(path, "w") as f:
+        json.dump(list(history), f, indent=2)
+
+
+def _metadata_case_keys(records: Sequence[Dict[str, object]]) -> set:
+    seen = set()
+    for rec in records:
+        for c in rec.get("trained_cases_this_run", []):
+            seen.add(f"{float(c['theta_goal_deg']):.6f}|{float(c['alpha_deg']):.6f}|{float(c['phi_deg']):.6f}")
+    return seen
 
 
 def _case_key(case: gps.GPSCase) -> str:
@@ -485,73 +520,85 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
     else:
         print("Starting training from scratch")
 
-    if skip_existing_cases and history:
-        seen = set()
-        for rec in history:
-            for c in rec.get("trained_cases_this_run", []):
-                seen.add(f"{float(c['theta_goal_deg']):.6f}|{float(c['alpha_deg']):.6f}|{float(c['phi_deg']):.6f}")
-        train_cases = [c for c in train_cases if _case_key(c) not in seen]
+    requested_cases = list(train_cases)
+    seen = _metadata_case_keys(history) if skip_existing_cases else set()
+    if skip_existing_cases and save_dir:
+        latest_path = os.path.join(save_dir, "latest_run_config.json")
+        if os.path.exists(latest_path):
+            with open(latest_path, "r") as f:
+                seen.update(_metadata_case_keys([json.load(f)]))
+    selected_cases, skipped_cases = [], []
+    for c in requested_cases:
+        (skipped_cases if skip_existing_cases and _case_key(c) in seen else selected_cases).append(c)
+    if skipped_cases:
+        print(f"Skipping {len(skipped_cases)} previously trained case(s).")
 
-    if sac_cfg.use_teacher_prefill:
+    if selected_cases and sac_cfg.use_teacher_prefill:
         if use_saved_teacher_summary:
-            teacher_output = prefill_from_saved_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache, save_dir, seed)
+            teacher_output = prefill_from_saved_teachers(agent, selected_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache, save_dir, seed)
         if teacher_output is None:
             if allow_fresh_cem_teachers:
-                teacher_output = prefill_with_gps_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache, teacher_cem_iters, teacher_population, seed, save_dir)
+                teacher_output = prefill_with_gps_teachers(agent, selected_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache, teacher_cem_iters, teacher_population, seed, save_dir)
             else:
                 print("No saved teachers found and fresh CEM teachers are disabled. Continuing without teacher prefill.")
+    elif not selected_cases:
+        print("No untrained cases selected; skipping interaction training for this run.")
 
-    for step in range(1, int(total_interactions) + 1):
-        case = train_cases[int(rng.integers(0, len(train_cases)))]
-        obs = case_obs(case)
-        if agent.total_interactions < sac_cfg.start_random_steps:
-            action = rng.uniform(-1.0, 1.0, size=traj_cfg.n_basis + 1).astype(np.float32)
-        else:
-            action = agent.act(obs, deterministic=False)
-        ev = evaluate_action(case, action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 10000 + step)
-        agent.replay.store(obs, action, ev["reward"], obs2=obs, done=True)
-        agent.total_interactions += 1
-        upd = agent.update(sac_cfg.updates_per_interaction)
-        if step % max(1, eval_every) == 0 or step == 1:
-            eval_rows = evaluate_sac_gps_policy(agent, train_cases[:min(8, len(train_cases))], traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 50000 + step, critic_refine=False)
-            mean_existing = float(np.mean([r["existing_metrics"]["total_cost"] for r in eval_rows]))
-            mean_actor = float(np.mean([r["actor_eval"]["cost"] for r in eval_rows]))
-            mean_imp = 100.0 * (mean_existing - mean_actor) / max(abs(mean_existing), 1e-12)
-            rec = dict(step=step, train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.detach().cpu().item()))
-            rec.update({k: float(v) for k, v in upd.items()})
-            history.append(rec)
-            print(f"SAC-GPS step {step:05d}/{total_interactions}: train_reward={ev['reward']:.4f}, actor_eval={mean_actor:.6g}, existing_eval={mean_existing:.6g}, improvement={mean_imp:.2f}%, buffer={agent.replay.len}")
+    if selected_cases:
+        for step in range(1, int(total_interactions) + 1):
+            case = selected_cases[int(rng.integers(0, len(selected_cases)))]
+            obs = case_obs(case)
+            if agent.total_interactions < sac_cfg.start_random_steps:
+                action = rng.uniform(-1.0, 1.0, size=traj_cfg.n_basis + 1).astype(np.float32)
+            else:
+                action = agent.act(obs, deterministic=False)
+            ev = evaluate_action(case, action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 10000 + step)
+            agent.replay.store(obs, action, ev["reward"], obs2=obs, done=True)
+            agent.total_interactions += 1
+            upd = agent.update(sac_cfg.updates_per_interaction)
+            if step % max(1, eval_every) == 0 or step == 1:
+                eval_rows = evaluate_sac_gps_policy(agent, selected_cases[:min(8, len(selected_cases))], traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 50000 + step, critic_refine=False)
+                mean_existing = float(np.mean([r["existing_metrics"]["total_cost"] for r in eval_rows]))
+                mean_actor = float(np.mean([r["actor_eval"]["cost"] for r in eval_rows]))
+                mean_imp = 100.0 * (mean_existing - mean_actor) / max(abs(mean_existing), 1e-12)
+                rec = dict(record_type="step", step=step, total_interactions=int(agent.total_interactions), train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.detach().cpu().item()))
+                rec.update({k: float(v) for k, v in upd.items()})
+                history.append(rec)
+                print(f"SAC-GPS step {step:05d}/{total_interactions}: train_reward={ev['reward']:.4f}, actor_eval={mean_actor:.6g}, existing_eval={mean_existing:.6g}, improvement={mean_imp:.2f}%, buffer={agent.replay.len}")
+
+    run_record = dict(
+        record_type="run",
+        timestamp=str(np.datetime64("now")),
+        resume_training=bool(resume_training),
+        skip_existing_cases=bool(skip_existing_cases),
+        total_interactions_requested=int(total_interactions),
+        total_interactions=int(agent.total_interactions),
+        teacher_cem_iters=int(teacher_cem_iters),
+        teacher_population=int(teacher_population),
+        eval_every=int(eval_every),
+        model_path=checkpoint_path,
+        trained_cases_this_run=[_case_to_dict(c) for c in selected_cases],
+        skipped_cases=[_case_to_dict(c) for c in skipped_cases],
+        replay_resumed=False,
+        replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer.",
+    )
 
     if save_dir:
         agent_path = os.path.join(save_dir, "sac_gps_agent.pt")
         actor_path = os.path.join(save_dir, "sac_gps_actor.pt")
+        run_record["model_path"] = agent_path
         agent.save(agent_path)
         torch.save(agent.actor.state_dict(), actor_path)
-        with open(os.path.join(save_dir, "training_history.json"), "w") as f:
-            json.dump(history, f, indent=2)
         with open(os.path.join(save_dir, "configs.json"), "w") as f:
             json.dump(dict(sac_cfg=asdict(sac_cfg), traj_cfg=asdict(traj_cfg), obj_cfg=asdict(obj_cfg)), f, indent=2)
-        run_record = dict(
-            timestamp=str(np.datetime64("now")),
-            resume_training=bool(resume_training),
-            skip_existing_cases=bool(skip_existing_cases),
-            total_interactions=int(total_interactions),
-            teacher_cem_iters=int(teacher_cem_iters),
-            teacher_population=int(teacher_population),
-            eval_every=int(eval_every),
-            model_path=agent_path,
-            trained_cases_this_run=[_case_to_dict(c) for c in train_cases],
-        )
         latest_path = os.path.join(save_dir, "latest_run_config.json")
         with open(latest_path, "w") as f:
             json.dump(run_record, f, indent=2)
-        history_records = _load_history_if_available(save_dir)
-        history_records.append(run_record)
-        with open(os.path.join(save_dir, "training_history.json"), "w") as f:
-            json.dump(history_records, f, indent=2)
+        history.append(run_record)
+        _save_history(save_dir, history)
         print(f"Saved model to: {agent_path}")
         print(f"Saved training metadata to: {latest_path}")
-    return dict(agent=agent, history=history, teacher_output=teacher_output, baseline_cache=baseline_cache, agent_loaded=agent_loaded)
+    return dict(agent=agent, history=history, teacher_output=teacher_output, baseline_cache=baseline_cache, agent_loaded=agent_loaded, train_cases=selected_cases, skipped_cases=skipped_cases)
 
 
 #%% ========================= EVALUATION / PLOTS =========================
@@ -585,8 +632,9 @@ def _save_or_show(fig, save_dir, name, show):
 
 
 def plot_training_history(history, save_dir=None, show=True):
+    history = [row for row in history if row.get("record_type", "step") == "step" and "step" in row]
     if not history: return
-    h = {k: np.array([row.get(k, np.nan) for row in history], dtype=float) for k in history[0].keys()}
+    h = {k: np.array([row.get(k, np.nan) for row in history], dtype=float) for k in history[0].keys() if k != "record_type"}
     step = h["step"]
     fig = plt.figure(figsize=(8,5)); plt.plot(step, h["train_reward"], label="train reward"); plt.plot(step, h["train_raw_reward"], label="raw reward")
     plt.xlabel("interactions"); plt.ylabel("reward"); plt.title("SAC-GPS reward"); plt.grid(True, alpha=.4); plt.legend(); _save_or_show(fig, save_dir, "training_reward.png", show)
