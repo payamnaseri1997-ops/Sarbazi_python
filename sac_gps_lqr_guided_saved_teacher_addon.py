@@ -9,13 +9,13 @@ trajectory, TDE+SMC rollout, and physical simulation are delegated to:
     true_gps_lqr_guided_addon.py -> LQR_TrjOPt_TDESMCwithRLresidual.py
 
 Saved model format:
-    save_dir/sac_gps_agent/actor.keras
-    save_dir/sac_gps_agent/q1.keras
-    save_dir/sac_gps_agent/q2.keras
-    save_dir/sac_gps_agent/q1_t.keras
-    save_dir/sac_gps_agent/q2_t.keras
-    save_dir/sac_gps_agent/state.json
-    save_dir/sac_gps_actor.keras
+    save_dir/sac_gps_agent.pt/actor.keras
+    save_dir/sac_gps_agent.pt/q1.keras
+    save_dir/sac_gps_agent.pt/q2.keras
+    save_dir/sac_gps_agent.pt/q1_t.keras
+    save_dir/sac_gps_agent.pt/q2_t.keras
+    save_dir/sac_gps_agent.pt/state.json
+    save_dir/sac_gps_actor.pt/actor.keras
     save_dir/training_history.json
     save_dir/configs.json
 """
@@ -327,7 +327,7 @@ class SACGPSAgent:
         self.q1_t.q.save(os.path.join(path, "q1_t.keras"))
         self.q2_t.q.save(os.path.join(path, "q2_t.keras"))
         with open(os.path.join(path, "state.json"), "w") as f:
-            json.dump(dict(log_alpha=float(self.log_alpha.numpy()), cfg=asdict(self.cfg), total_interactions=int(self.total_interactions), replay_resumed=False, replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer."), f, indent=2)
+            json.dump(dict(log_alpha=float(self.log_alpha.numpy()), cfg=asdict(self.cfg), total_interactions=int(self.total_interactions), replay_resumed=False, replay_note="Replay buffer is not checkpointed; resumed SAC runs reload saved CEM teachers and start with a refilled replay buffer."), f, indent=2)
 
     def load(self, path: str):
         self.actor.net = keras.models.load_model(os.path.join(path, "actor.keras"))
@@ -403,24 +403,50 @@ def _teacher_key(goal_deg: float, alpha_deg: float, phi_deg: float) -> Tuple[flo
 
 
 def _load_teacher_summary(save_dir: Optional[str]) -> Dict[Tuple[float, float, float], Dict[str, object]]:
+    """Load saved teachers from old and new JSON formats.
+
+    Supported inputs:
+      * teacher_summary.json legacy rows: goal/alpha/phi/action
+      * training_teachers.json rows: theta_goal_deg/alpha_deg/phi_deg/best_params
+      * teacher_summary.json new rows: theta_goal_deg/alpha_deg/phi_deg/best_action/best_params
+    """
     if not save_dir:
         return {}
-    candidates = [os.path.join(save_dir, "teacher_summary.json"), os.path.join(save_dir, "training_teachers.json")]
-    path = next((q for q in candidates if os.path.exists(q)), None)
-    if path is None:
-        return {}
-    with open(path, "r") as f:
-        rows = json.load(f)
-    out = {}
-    base = os.path.basename(path)
-    for row in rows:
-        if base == "teacher_summary.json":
-            key = _teacher_key(row["goal"], row["alpha"], row["phi"])
-            row = dict(row); row["_format"] = "action"; out[key] = row
-        else:
-            key = _teacher_key(row["theta_goal_deg"], row["alpha_deg"], row["phi_deg"])
-            row = dict(row); row["_format"] = "params"; out[key] = row
-    print(f"Loaded {len(out)} saved teacher rows from: {path}")
+    candidates = [
+        os.path.join(save_dir, "teacher_summary.json"),
+        os.path.join(save_dir, "training_teachers.json"),
+    ]
+    out: Dict[Tuple[float, float, float], Dict[str, object]] = {}
+    loaded_paths: List[str] = []
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r") as f:
+            rows = json.load(f)
+        if isinstance(rows, dict):
+            rows = rows.get("rows", rows.get("teachers", []))
+        for row0 in rows:
+            row = dict(row0)
+            if {"goal", "alpha", "phi"}.issubset(row):
+                key = _teacher_key(row["goal"], row["alpha"], row["phi"])
+            elif {"theta_goal_deg", "alpha_deg", "phi_deg"}.issubset(row):
+                key = _teacher_key(row["theta_goal_deg"], row["alpha_deg"], row["phi_deg"])
+            else:
+                continue
+            has_action = "best_action" in row or "action" in row
+            has_params = "best_params" in row
+            if has_action and has_params:
+                row["_format"] = "action_and_params"
+            elif has_action:
+                row["_format"] = "action"
+            elif has_params:
+                row["_format"] = "params"
+            else:
+                continue
+            out[key] = row
+        loaded_paths.append(path)
+    if loaded_paths:
+        print(f"Loaded {len(out)} saved teacher rows from: {', '.join(loaded_paths)}")
     return out
 
 
@@ -429,6 +455,7 @@ def prefill_from_saved_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, 
     if not teacher_map:
         return None
     rows, bc_obs, bc_act = [], [], []
+    found_cases, missing_cases = [], []
     zero_action = np.zeros(traj_cfg.n_basis + 1, dtype=np.float32)
     for i, case in enumerate(train_cases):
         obs = case_obs(case)
@@ -436,23 +463,32 @@ def prefill_from_saved_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, 
         agent.replay.store(obs, zero_action, zero_ev["reward"], obs2=obs, done=True)
         saved = teacher_map.get(_teacher_key(case.theta_goal_deg, case.alpha_deg, case.phi_deg))
         if saved is None:
-            print(f"No saved teacher for {case.label()} -- skipped teacher action for this case.")
+            missing_cases.append(case.label())
             continue
-        if saved.get("_format") == "action":
+        if "best_action" in saved:
+            best_action = np.asarray(saved["best_action"], dtype=np.float32)
+        elif "action" in saved:
             best_action = np.asarray(saved["action"], dtype=np.float32)
-        elif saved.get("_format") == "params":
+        elif "best_params" in saved:
             best_action = params_to_action(np.asarray(saved["best_params"], dtype=np.float32), traj_cfg, sac_cfg)
         else:
-            raise ValueError(f"Unknown saved teacher format for {case.label()}")
+            missing_cases.append(case.label())
+            continue
         best_ev = evaluate_action(case, best_action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 2000 + i)
         agent.replay.store(obs, best_action, best_ev["reward"], obs2=obs, done=True)
         bc_obs.append(obs); bc_act.append(best_action)
         rows.append(dict(case=case, zero_eval=zero_ev, best_eval=best_ev, best_action=best_action, saved_teacher=saved))
+        found_cases.append(case.label())
         print(f"saved teacher {i+1}/{len(train_cases)}: {case.label()} | existing={best_ev['existing_cost']:.6g}, cost={best_ev['cost']:.6g}, improvement={best_ev['improvement_pct']:.2f}%")
+    print(f"Saved teacher prefill found {len(found_cases)}/{len(train_cases)} cases.")
+    if found_cases:
+        print("Cases with saved teachers: " + ", ".join(found_cases))
+    if missing_cases:
+        print("Cases missing saved teachers: " + ", ".join(missing_cases))
     bc_losses = []
     if bc_obs and sac_cfg.behavior_clone_epochs > 0:
         bc_losses = agent.behavior_clone(np.stack(bc_obs), np.stack(bc_act), sac_cfg.behavior_clone_epochs, sac_cfg.behavior_clone_lr)
-    return dict(rows=rows, bc_losses=bc_losses, loaded_from="saved_teacher_json")
+    return dict(rows=rows, bc_losses=bc_losses, loaded_from="saved_teacher_json", found_cases=found_cases, missing_cases=missing_cases)
 
 
 def prefill_with_gps_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache, teacher_cem_iters, teacher_population, seed, save_dir=None):
@@ -478,6 +514,163 @@ def prefill_with_gps_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, ba
         with open(os.path.join(save_dir, "teacher_summary.json"), "w") as f:
             json.dump([dict(goal=r["case"].theta_goal_deg, alpha=r["case"].alpha_deg, phi=r["case"].phi_deg, existing=r["best_eval"]["existing_cost"], teacher=r["best_eval"]["cost"], improvement_pct=r["best_eval"]["improvement_pct"], action=r["best_action"].tolist()) for r in rows], f, indent=2)
     return dict(rows=rows, bc_losses=bc_losses, loaded_from="fresh_cem")
+
+
+
+def _json_load_list(path: str) -> List[Dict[str, object]]:
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return list(data.get("rows", data.get("history", data.get("teachers", []))))
+    return []
+
+
+def _json_dump(path: str, data) -> None:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def generate_or_resume_cem_teachers(
+    train_cases,
+    traj_cfg,
+    obj_cfg,
+    sac_cfg,
+    save_dir,
+    cem_iters=4,
+    population=20,
+    elite_frac=0.25,
+    seed=0,
+    resume=True,
+    skip_existing_cases=True,
+):
+    """Generate GPS/LQR-guided CEM teachers one case at a time and save after each case.
+
+    This stage does not create or train a SAC agent. It only calls the delegated
+    true_gps/LQR optimization utilities and writes resumable teacher artifacts.
+    """
+    mkdir(save_dir)
+    summary_path = os.path.join(save_dir, "teacher_summary.json")
+    history_path = os.path.join(save_dir, "cem_teacher_history.json")
+    config_path = os.path.join(save_dir, "latest_cem_config.json")
+    requested_cases = list(train_cases)
+    requested_keys = {_teacher_key(c.theta_goal_deg, c.alpha_deg, c.phi_deg) for c in requested_cases}
+
+    existing_rows = _json_load_list(summary_path) if resume else []
+    if not resume:
+        existing_rows = [
+            r for r in existing_rows
+            if _teacher_key(
+                r.get("theta_goal_deg", r.get("goal", np.nan)),
+                r.get("alpha_deg", r.get("alpha", np.nan)),
+                r.get("phi_deg", r.get("phi", np.nan)),
+            ) not in requested_keys
+        ]
+    teacher_rows = list(existing_rows)
+    teacher_map = {}
+    for row in teacher_rows:
+        if {"theta_goal_deg", "alpha_deg", "phi_deg"}.issubset(row):
+            teacher_map[_teacher_key(row["theta_goal_deg"], row["alpha_deg"], row["phi_deg"])] = row
+        elif {"goal", "alpha", "phi"}.issubset(row):
+            teacher_map[_teacher_key(row["goal"], row["alpha"], row["phi"])] = row
+
+    history = _json_load_list(history_path) if resume else []
+    config = dict(
+        timestamp=str(np.datetime64("now")),
+        requested_teacher_cases=len(requested_cases),
+        cem_iters=int(cem_iters),
+        population=int(population),
+        elite_frac=float(elite_frac),
+        seed=int(seed),
+        resume=bool(resume),
+        skip_existing_cases=bool(skip_existing_cases),
+        save_dir=save_dir,
+        traj_cfg=asdict(traj_cfg),
+        obj_cfg=asdict(obj_cfg),
+        sac_cfg=asdict(sac_cfg),
+        cases=[_case_to_dict(c) for c in requested_cases],
+    )
+    _json_dump(config_path, config)
+
+    completed_cases, skipped_cases, failed_cases = [], [], []
+    print(f"Requested CEM teacher cases: {len(requested_cases)}")
+    for i, case in enumerate(requested_cases):
+        key = _teacher_key(case.theta_goal_deg, case.alpha_deg, case.phi_deg)
+        if resume and skip_existing_cases and key in teacher_map:
+            skipped_cases.append(case)
+            print(f"Skipping completed CEM teacher case {i+1}/{len(requested_cases)}: {case.label()}")
+            continue
+        print(f"\n=== CEM teacher case {i+1}/{len(requested_cases)}: {case.label()} ===")
+        try:
+            baseline_cache = BaselineCache(obj_cfg)
+            teacher = gps.cem_optimize_guided_case(
+                case=case,
+                traj_cfg=traj_cfg,
+                obj_cfg=obj_cfg,
+                init_mean=np.zeros(traj_cfg.n_basis + 1),
+                init_std=np.r_[np.ones(traj_cfg.n_basis) * 0.55, 0.35],
+                cem_iters=cem_iters,
+                population=population,
+                elite_frac=elite_frac,
+                seed=seed + 1000 + 31 * i,
+            )
+            best_params = np.asarray(teacher["best"]["params"], dtype=np.float32)
+            best_action = params_to_action(best_params, traj_cfg, sac_cfg)
+            best_ev = evaluate_action(case, best_action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 2000 + i)
+            row = dict(
+                theta_goal_deg=float(case.theta_goal_deg),
+                alpha_deg=float(case.alpha_deg),
+                phi_deg=float(case.phi_deg),
+                existing_cost=float(best_ev["existing_cost"]),
+                teacher_cost=float(best_ev["cost"]),
+                improvement_pct=float(best_ev["improvement_pct"]),
+                best_params=best_params.astype(float).tolist(),
+                best_action=best_action.astype(float).tolist(),
+                cem_iters=int(cem_iters),
+                population=int(population),
+                seed=int(seed + 1000 + 31 * i),
+                timestamp=str(np.datetime64("now")),
+            )
+            teacher_rows = [
+                r for r in teacher_rows
+                if _teacher_key(
+                    r.get("theta_goal_deg", r.get("goal", np.nan)),
+                    r.get("alpha_deg", r.get("alpha", np.nan)),
+                    r.get("phi_deg", r.get("phi", np.nan)),
+                ) != key
+            ]
+            teacher_rows.append(row)
+            teacher_map[key] = row
+            _json_dump(summary_path, teacher_rows)
+            history_record = dict(record_type="case", status="completed", case=_case_to_dict(case), teacher_row=row)
+            history.append(history_record)
+            _json_dump(history_path, history)
+            completed_cases.append(case)
+            print(f"Saved teacher summary after case {i+1}: {summary_path}")
+        except Exception as exc:
+            failed_cases.append(case)
+            failure = dict(
+                record_type="case",
+                status="failed",
+                timestamp=str(np.datetime64("now")),
+                case=_case_to_dict(case),
+                error=repr(exc),
+            )
+            history.append(failure)
+            _json_dump(history_path, history)
+            print(f"CEM teacher failed for {case.label()}: {exc!r}. Continuing.")
+    print(f"CEM teacher stage complete: requested={len(requested_cases)}, completed={len(completed_cases)}, skipped={len(skipped_cases)}, failed={len(failed_cases)}")
+    print(f"Teacher summary path: {summary_path}")
+    return dict(
+        teacher_rows=teacher_rows,
+        completed_cases=completed_cases,
+        skipped_cases=skipped_cases,
+        failed_cases=failed_cases,
+        save_dir=save_dir,
+    )
 
 
 def _load_history_if_available(save_dir: Optional[str]) -> List[Dict[str, object]]:
@@ -520,7 +713,29 @@ def _case_to_dict(case: gps.GPSCase) -> Dict[str, float]:
     return {"theta_goal_deg": float(case.theta_goal_deg), "alpha_deg": float(case.alpha_deg), "phi_deg": float(case.phi_deg)}
 
 
-def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=1000, teacher_cem_iters=4, teacher_population=20, eval_every=50, seed=0, save_dir=None, use_saved_teacher_summary=True, allow_fresh_cem_teachers=False, resume_training=False, skip_existing_cases=False):
+def _save_sac_artifacts(agent, save_dir, history, run_record, traj_cfg, obj_cfg, sac_cfg):
+    if not save_dir:
+        return
+    mkdir(save_dir)
+    agent_path = os.path.join(save_dir, "sac_gps_agent.pt")
+    actor_path = os.path.join(save_dir, "sac_gps_actor.pt")
+    agent.save(agent_path)
+    mkdir(actor_path)
+    agent.actor.net.save(os.path.join(actor_path, "actor.keras"))
+    run_record["model_path"] = agent_path
+    run_record["actor_path"] = actor_path
+    with open(os.path.join(save_dir, "configs.json"), "w") as f:
+        json.dump(dict(sac_cfg=asdict(sac_cfg), traj_cfg=asdict(traj_cfg), obj_cfg=asdict(obj_cfg)), f, indent=2)
+    latest_path = os.path.join(save_dir, "latest_run_config.json")
+    with open(latest_path, "w") as f:
+        json.dump(run_record, f, indent=2)
+    _save_history(save_dir, history)
+    print(f"Saved SAC checkpoint to: {agent_path}")
+    print(f"Saved SAC actor to: {actor_path}")
+    print(f"Saved training metadata to: {latest_path}")
+
+
+def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=1000, teacher_cem_iters=4, teacher_population=20, eval_every=50, seed=0, save_dir=None, use_saved_teacher_summary=True, allow_fresh_cem_teachers=False, resume_training=False, skip_existing_cases=False, save_every=50):
     _print_tensorflow_diagnostics()
     mkdir(save_dir)
     rng = np.random.default_rng(seed)
@@ -529,30 +744,26 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
     baseline_cache = BaselineCache(obj_cfg)
     history = _load_history_if_available(save_dir)
     teacher_output = None
-    checkpoint_path = os.path.join(save_dir, "sac_gps_agent") if save_dir else "sac_gps_agent"
+    checkpoint_path = os.path.join(save_dir, "sac_gps_agent.pt") if save_dir else "sac_gps_agent.pt"
     agent_loaded = False
 
     if resume_training:
-        if os.path.exists(checkpoint_path):
-            agent.load(checkpoint_path); agent_loaded = True
-            print(f"Resuming training from: {checkpoint_path}")
-        else:
-            raise FileNotFoundError(f"resume_training=True but no saved model found at: {checkpoint_path}")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"resume_training=True but no saved SAC checkpoint found at: {checkpoint_path}")
+        agent.load(checkpoint_path); agent_loaded = True
+        print(f"SAC checkpoint loaded: {checkpoint_path}")
     else:
-        print("Starting training from scratch")
+        print("Starting SAC actor/critic training from scratch.")
+    interactions_before = int(agent.total_interactions)
+    print(f"Total interactions before training: {interactions_before}")
 
     requested_cases = list(train_cases)
-    seen = _metadata_case_keys(history) if skip_existing_cases else set()
-    if skip_existing_cases and save_dir:
-        latest_path = os.path.join(save_dir, "latest_run_config.json")
-        if os.path.exists(latest_path):
-            with open(latest_path, "r") as f:
-                seen.update(_metadata_case_keys([json.load(f)]))
-    selected_cases, skipped_cases = [], []
-    for c in requested_cases:
-        (skipped_cases if skip_existing_cases and _case_key(c) in seen else selected_cases).append(c)
-    if skipped_cases:
-        print(f"Skipping {len(skipped_cases)} previously trained case(s).")
+    # CEM skip_existing_cases only controls teacher generation. SAC should still use
+    # the full train_cases list so saved teachers remain available for replay prefill.
+    selected_cases = requested_cases
+    skipped_cases: List[gps.GPSCase] = []
+    if skip_existing_cases:
+        print("SAC skip_existing_cases is ignored for actor/critic training; using all train_cases. Use the CEM stage skip flag to avoid recomputing teachers.")
 
     if selected_cases and sac_cfg.use_teacher_prefill:
         if use_saved_teacher_summary:
@@ -563,7 +774,26 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
             else:
                 print("No saved teachers found and fresh CEM teachers are disabled. Continuing without teacher prefill.")
     elif not selected_cases:
-        print("No untrained cases selected; skipping interaction training for this run.")
+        print("No SAC training cases selected; saving metadata without interaction training.")
+
+    run_record = dict(
+        record_type="run",
+        timestamp=str(np.datetime64("now")),
+        resume_training=bool(resume_training),
+        skip_existing_cases=bool(skip_existing_cases),
+        total_interactions_requested=int(total_interactions),
+        total_interactions_before=interactions_before,
+        total_interactions=int(agent.total_interactions),
+        teacher_cem_iters=int(teacher_cem_iters),
+        teacher_population=int(teacher_population),
+        eval_every=int(eval_every),
+        save_every=int(save_every),
+        model_path=checkpoint_path,
+        trained_cases_this_run=[_case_to_dict(c) for c in selected_cases],
+        skipped_cases=[_case_to_dict(c) for c in skipped_cases],
+        replay_resumed=False,
+        replay_note="Replay buffer is not checkpointed; resumed SAC runs reload saved CEM teachers and start with a refilled replay buffer.",
+    )
 
     if selected_cases:
         for step in range(1, int(total_interactions) + 1):
@@ -585,40 +815,19 @@ def train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interacti
                 rec = dict(record_type="step", step=step, total_interactions=int(agent.total_interactions), train_reward=float(ev["reward"]), train_raw_reward=float(ev["raw_reward"]), train_cost=float(ev["cost"]), train_existing_cost=float(ev["existing_cost"]), mean_eval_existing=mean_existing, mean_eval_actor=mean_actor, mean_eval_improvement_pct=mean_imp, buffer=float(agent.replay.len), alpha=float(agent.alpha.numpy()))
                 rec.update({k: float(v) for k, v in upd.items()})
                 history.append(rec)
-                print(f"SAC-GPS step {step:05d}/{total_interactions}: train_reward={ev['reward']:.4f}, actor_eval={mean_actor:.6g}, existing_eval={mean_existing:.6g}, improvement={mean_imp:.2f}%, buffer={agent.replay.len}")
+                print(f"SAC-GPS step {step:05d}/{total_interactions}: total_interactions={agent.total_interactions}, train_reward={ev['reward']:.4f}, actor_eval={mean_actor:.6g}, existing_eval={mean_existing:.6g}, improvement={mean_imp:.2f}%, buffer={agent.replay.len}")
+            if save_dir and step % max(1, int(save_every)) == 0:
+                run_record["total_interactions"] = int(agent.total_interactions)
+                run_record["timestamp"] = str(np.datetime64("now"))
+                _save_sac_artifacts(agent, save_dir, history, run_record, traj_cfg, obj_cfg, sac_cfg)
+                print(f"SAC checkpoint saved at local step {step} (every {save_every} steps).")
 
-    run_record = dict(
-        record_type="run",
-        timestamp=str(np.datetime64("now")),
-        resume_training=bool(resume_training),
-        skip_existing_cases=bool(skip_existing_cases),
-        total_interactions_requested=int(total_interactions),
-        total_interactions=int(agent.total_interactions),
-        teacher_cem_iters=int(teacher_cem_iters),
-        teacher_population=int(teacher_population),
-        eval_every=int(eval_every),
-        model_path=checkpoint_path,
-        trained_cases_this_run=[_case_to_dict(c) for c in selected_cases],
-        skipped_cases=[_case_to_dict(c) for c in skipped_cases],
-        replay_resumed=False,
-        replay_note="Replay buffer is not checkpointed; resumed runs start with an empty replay buffer.",
-    )
-
+    run_record["total_interactions"] = int(agent.total_interactions)
+    run_record["timestamp"] = str(np.datetime64("now"))
+    history.append(run_record)
     if save_dir:
-        agent_path = os.path.join(save_dir, "sac_gps_agent")
-        actor_path = os.path.join(save_dir, "sac_gps_actor.keras")
-        run_record["model_path"] = agent_path
-        agent.save(agent_path)
-        agent.actor.net.save(actor_path)
-        with open(os.path.join(save_dir, "configs.json"), "w") as f:
-            json.dump(dict(sac_cfg=asdict(sac_cfg), traj_cfg=asdict(traj_cfg), obj_cfg=asdict(obj_cfg)), f, indent=2)
-        latest_path = os.path.join(save_dir, "latest_run_config.json")
-        with open(latest_path, "w") as f:
-            json.dump(run_record, f, indent=2)
-        history.append(run_record)
-        _save_history(save_dir, history)
-        print(f"Saved model to: {agent_path}")
-        print(f"Saved training metadata to: {latest_path}")
+        _save_sac_artifacts(agent, save_dir, history, run_record, traj_cfg, obj_cfg, sac_cfg)
+    print(f"Total interactions after training: {agent.total_interactions}")
     return dict(agent=agent, history=history, teacher_output=teacher_output, baseline_cache=baseline_cache, agent_loaded=agent_loaded, train_cases=selected_cases, skipped_cases=skipped_cases)
 
 
@@ -679,49 +888,127 @@ def print_constraint_report(rows, obj_cfg):
         print(f"{case.label()}: existing={best['existing_cost']:.6g}, best={best['cost']:.6g}, imp={best['improvement_pct']:.2f}%, max|omega|={m['max_abs_omega']:.4g}/{obj_cfg.omega_limit}, max|tau_m|={m['max_abs_tau_m']:.4g}/{obj_cfg.torque_limit}, max|u|={m['max_abs_u_total']:.4g}/{obj_cfg.command_limit}, final_err={m['final_theta_error']:.4g}")
 
 
-#%% ========================= SPYDER RUNNER =========================
-if __name__ == "__main__":
-    train_goal_degs = (0, 30, 60, 90, 120, 150, 180)
-    test_goal_degs = (15, 45, 75, 105, 135, 165, 180)
-    tilt_degs = (0, 5, 10, 15, 20)
-    coupled_tilts = True
-    save_dir = "true_gps_results_smoke"
-    show_plots = True
-    seed = 0
-    resume_training = False
-    skip_existing_cases = False
-    use_saved_teacher_summary = True
-    allow_fresh_cem_teachers = False
-    total_interactions = 1000
-    teacher_cem_iters = 4
-    teacher_population = 20
-    eval_every = 50
+#%% ========================= USER SETTINGS =========================
+TRAIN_GOAL_DEGS = (0, 30, 60, 90, 120, 150, 180)
+TEST_GOAL_DEGS = (15, 45, 75, 105, 135, 165, 180)
+TILT_DEGS = (0, 5, 10, 15, 20)
+COUPLED_TILTS = True
 
-    traj_cfg, obj_cfg, sac_cfg = make_default_configs()
-    mkdir(save_dir)
-    train_cases = gps.make_cases(train_goal_degs, tilt_degs, coupled_tilts=coupled_tilts)
-    test_cases = gps.make_cases(test_goal_degs, tilt_degs, coupled_tilts=coupled_tilts)
+SAVE_DIR = "true_gps_results_smoke"
+SHOW_PLOTS = True
+SEED = 0
 
-    print("\n=== SAC-GPS actor-critic trajectory learning/resume ===")
-    print(f"train cases={len(train_cases)}, test cases={len(test_cases)}, tilts={list(tilt_degs)}, coupled={coupled_tilts}")
-    print("TDE+SMC controller and plant dynamics are from LQR_TrjOPt_TDESMCwithRLresidual.py.")
-    print(f"save_dir = {save_dir}")
+# Stage switches
+RUN_CEM_TEACHERS = True
+RUN_SAC_TRAINING = True
+RUN_EVALUATION = True
 
-    train_output = train_sac_gps_agent(train_cases, traj_cfg, obj_cfg, sac_cfg, total_interactions=total_interactions, teacher_cem_iters=teacher_cem_iters, teacher_population=teacher_population, eval_every=eval_every, seed=seed, save_dir=save_dir, use_saved_teacher_summary=use_saved_teacher_summary, allow_fresh_cem_teachers=allow_fresh_cem_teachers, resume_training=resume_training, skip_existing_cases=skip_existing_cases)
+# Resume switches
+RESUME_CEM_TEACHERS = True
+RESUME_SAC_TRAINING = True
+SKIP_EXISTING_CASES = True
+
+# CEM teacher settings
+TEACHER_CEM_ITERS = 4
+TEACHER_POPULATION = 20
+TEACHER_ELITE_FRAC = 0.25
+
+# SAC settings
+TOTAL_INTERACTIONS = 1000
+EVAL_EVERY = 50
+SAVE_EVERY = 50
+USE_SAVED_TEACHER_SUMMARY = True
+ALLOW_FRESH_CEM_TEACHERS = False
+
+
+#%% ========================= BUILD CONFIGS AND CASES =========================
+traj_cfg, obj_cfg, sac_cfg = make_default_configs()
+mkdir(SAVE_DIR)
+train_cases = gps.make_cases(TRAIN_GOAL_DEGS, TILT_DEGS, coupled_tilts=COUPLED_TILTS)
+test_cases = gps.make_cases(TEST_GOAL_DEGS, TILT_DEGS, coupled_tilts=COUPLED_TILTS)
+
+print("\n=== SAC-GPS two-stage resumable trajectory learning ===")
+print(f"train goals={list(TRAIN_GOAL_DEGS)}, test goals={list(TEST_GOAL_DEGS)}")
+print(f"tilts={list(TILT_DEGS)}, coupled={COUPLED_TILTS}")
+print(f"train cases={len(train_cases)}, test cases={len(test_cases)}")
+print("Plant/model/LQR/TDE+SMC rollout source: LQR_TrjOPt_TDESMCwithRLresidual.py and true_gps_lqr_guided_addon.py")
+print(f"save_dir = {SAVE_DIR}")
+
+
+#%% ========================= STAGE 1: RESUMABLE CEM TEACHERS =========================
+teacher_stage_output = None
+if RUN_CEM_TEACHERS:
+    teacher_stage_output = generate_or_resume_cem_teachers(
+        train_cases=train_cases,
+        traj_cfg=traj_cfg,
+        obj_cfg=obj_cfg,
+        sac_cfg=sac_cfg,
+        save_dir=SAVE_DIR,
+        cem_iters=TEACHER_CEM_ITERS,
+        population=TEACHER_POPULATION,
+        elite_frac=TEACHER_ELITE_FRAC,
+        seed=SEED,
+        resume=RESUME_CEM_TEACHERS,
+        skip_existing_cases=SKIP_EXISTING_CASES,
+    )
+else:
+    print("Skipping CEM teacher stage because RUN_CEM_TEACHERS=False.")
+
+
+#%% ========================= STAGE 2: RESUMABLE SAC TRAINING =========================
+train_output = None
+agent = None
+baseline_cache = None
+if RUN_SAC_TRAINING:
+    train_output = train_sac_gps_agent(
+        train_cases=train_cases,
+        traj_cfg=traj_cfg,
+        obj_cfg=obj_cfg,
+        sac_cfg=sac_cfg,
+        total_interactions=TOTAL_INTERACTIONS,
+        teacher_cem_iters=TEACHER_CEM_ITERS,
+        teacher_population=TEACHER_POPULATION,
+        eval_every=EVAL_EVERY,
+        seed=SEED,
+        save_dir=SAVE_DIR,
+        use_saved_teacher_summary=USE_SAVED_TEACHER_SUMMARY,
+        allow_fresh_cem_teachers=ALLOW_FRESH_CEM_TEACHERS,
+        resume_training=RESUME_SAC_TRAINING,
+        skip_existing_cases=SKIP_EXISTING_CASES,
+        save_every=SAVE_EVERY,
+    )
     agent = train_output["agent"]
     baseline_cache = train_output["baseline_cache"]
-    rows = evaluate_sac_gps_policy(agent, test_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache=baseline_cache, seed=seed + 200000, critic_refine=True)
-    print_constraint_report(rows, obj_cfg)
+else:
+    print("Skipping SAC training stage because RUN_SAC_TRAINING=False.")
 
-    table = []
-    for r in rows:
+
+#%% ========================= STAGE 3: EVALUATION =========================
+eval_rows = []
+if RUN_EVALUATION:
+    if agent is None:
+        _print_tensorflow_diagnostics()
+        agent = SACGPSAgent(obs_dim=3, act_dim=traj_cfg.n_basis + 1, cfg=sac_cfg)
+        checkpoint_path = os.path.join(SAVE_DIR, "sac_gps_agent.pt")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"RUN_EVALUATION=True but no SAC checkpoint exists at: {checkpoint_path}")
+        agent.load(checkpoint_path)
+        baseline_cache = BaselineCache(obj_cfg)
+    eval_rows = evaluate_sac_gps_policy(agent, test_cases, traj_cfg, obj_cfg, sac_cfg, baseline_cache=baseline_cache, seed=SEED + 200000, critic_refine=True)
+    print_constraint_report(eval_rows, obj_cfg)
+
+    evaluation_table = []
+    for r in eval_rows:
         case = r["case"]; best = r["best_eval"]; m = best["metrics"]
-        table.append(dict(theta_goal_deg=case.theta_goal_deg, alpha_deg=case.alpha_deg, phi_deg=case.phi_deg, existing_cost=best["existing_cost"], actor_cost=r["actor_eval"]["cost"], refined_cost=r["refined_eval"]["cost"], best_cost=best["cost"], improvement_pct=best["improvement_pct"], max_abs_omega=m["max_abs_omega"], max_abs_tau_m=m["max_abs_tau_m"], max_abs_u_total=m["max_abs_u_total"], final_theta_error=m["final_theta_error"], duration=m["duration"]))
-    with open(os.path.join(save_dir, "evaluation_table.json"), "w") as f:
-        json.dump(table, f, indent=2)
-    plot_training_history(train_output["history"], save_dir=save_dir, show=show_plots)
-    plot_evaluation_summary(rows, obj_cfg=obj_cfg, save_dir=save_dir, show=show_plots)
-    results = dict(agent=agent, train_output=train_output, eval_rows=rows, train_cases=train_cases, test_cases=test_cases, traj_cfg=traj_cfg, obj_cfg=obj_cfg, sac_cfg=sac_cfg, save_dir=save_dir)
-    print("\nDone. Results are stored in variable: results")
-    print(f"Saved outputs to: {save_dir}")
-    # Example resume: set resume_training=True to continue from sac_gps_agent.
+        evaluation_table.append(dict(theta_goal_deg=case.theta_goal_deg, alpha_deg=case.alpha_deg, phi_deg=case.phi_deg, existing_cost=best["existing_cost"], actor_cost=r["actor_eval"]["cost"], refined_cost=r["refined_eval"]["cost"], best_cost=best["cost"], improvement_pct=best["improvement_pct"], max_abs_omega=m["max_abs_omega"], max_abs_tau_m=m["max_abs_tau_m"], max_abs_u_total=m["max_abs_u_total"], final_theta_error=m["final_theta_error"], duration=m["duration"]))
+    with open(os.path.join(SAVE_DIR, "evaluation_table.json"), "w") as f:
+        json.dump(evaluation_table, f, indent=2)
+    if train_output is not None:
+        plot_training_history(train_output["history"], save_dir=SAVE_DIR, show=SHOW_PLOTS)
+    plot_evaluation_summary(eval_rows, obj_cfg=obj_cfg, save_dir=SAVE_DIR, show=SHOW_PLOTS)
+else:
+    print("Skipping evaluation stage because RUN_EVALUATION=False.")
+
+results = dict(agent=agent, train_output=train_output, teacher_stage_output=teacher_stage_output, eval_rows=eval_rows, train_cases=train_cases, test_cases=test_cases, traj_cfg=traj_cfg, obj_cfg=obj_cfg, sac_cfg=sac_cfg, save_dir=SAVE_DIR)
+print("\nDone. Results are stored in variable: results")
+print(f"Saved outputs to: {SAVE_DIR}")
