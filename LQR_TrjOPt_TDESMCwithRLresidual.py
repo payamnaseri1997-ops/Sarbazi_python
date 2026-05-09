@@ -112,6 +112,7 @@ COST_W_E = 8.0
 COST_W_EDOT = 1.0
 COST_W_U = 0.03
 COST_W_OMEGA = 0.3
+COST_W_TIME = 0.05
 GOAL_TOL = 1e-2
 DONE_BONUS = 2.0
 
@@ -205,6 +206,7 @@ class CostConfig:
     w_edot: float
     w_u: float
     w_omega: float
+    w_time: float
     goal_tol: float
     done_bonus: float
 
@@ -632,7 +634,15 @@ def build_system_from_settings():
     pp_k=PP_SMC_K,
     pp_phi=PP_SMC_PHI,
 )
-    cost_cfg = CostConfig(w_e=COST_W_E, w_edot=COST_W_EDOT, w_u=COST_W_U, w_omega=COST_W_OMEGA, goal_tol=GOAL_TOL, done_bonus=DONE_BONUS)
+    cost_cfg = CostConfig(
+        w_e=COST_W_E,
+        w_edot=COST_W_EDOT,
+        w_u=COST_W_U,
+        w_omega=COST_W_OMEGA,
+        w_time=COST_W_TIME,
+        goal_tol=GOAL_TOL,
+        done_bonus=DONE_BONUS,
+    )
     return plant_p, nom, lqr_w, smc_cfg, cost_cfg
 
 
@@ -943,7 +953,10 @@ def rollout_once(
         pp_eps_dot_log = np.full(N, np.nan)
         pp_violation_log = np.zeros(N)
 
-    total_cost = 0.0
+    J_e = 0.0
+    J_edot = 0.0
+    J_omega = 0.0
+    J_time = 0.0
     done = False
     steps_taken = 0
     t = 0.0
@@ -974,12 +987,12 @@ def rollout_once(
         e = info["e"]
         edot = info["edot"]
 
-        stage = (
-            cost_cfg.w_e * e * e
-            + cost_cfg.w_edot * edot * edot
-            + cost_cfg.w_omega * omega * omega
-        )
-        total_cost += stage * dt
+        J_e += cost_cfg.w_e * e * e * dt
+        J_edot += cost_cfg.w_edot * edot * edot * dt
+        J_omega += cost_cfg.w_omega * omega * omega * dt
+        J_time += cost_cfg.w_time * dt
+
+        total_cost = J_e + J_edot + J_omega + J_time
 
         theta2, omega2, _ = plant.state.copy()
         if abs(theta2 - task.theta_goal) < cost_cfg.goal_tol and abs(omega2) < cost_cfg.goal_tol:
@@ -1030,6 +1043,11 @@ def rollout_once(
 
     metrics = dict(
         total_cost=total_cost,
+        J_e=J_e,
+        J_edot=J_edot,
+        J_omega=J_omega,
+        J_time=J_time,
+        duration=steps_taken * dt,
         finished=1.0 if done else 0.0,
         time=t,
     )
@@ -1193,6 +1211,14 @@ logs_demo = evaluate_and_rollout(TRJ_TYPE)
 print(f"Trajectory type = {TRJ_TYPE}")
 print(f"Reference kind = {logs_demo.get('reference_kind')}")
 print(f"Total cost = {logs_demo['metrics']['total_cost']:.6g}")
+m = logs_demo["metrics"]
+print("\n=== Cost breakdown ===")
+print(f"J_e      = {m['J_e']:.6g}")
+print(f"J_edot   = {m['J_edot']:.6g}")
+print(f"J_omega  = {m['J_omega']:.6g}")
+print(f"J_time   = {m['J_time']:.6g}")
+print(f"duration = {m['duration']:.6g} s")
+print(f"total    = {m['total_cost']:.6g}")
 
 
 #%% ========================= PLOT ROLLOUT =========================
