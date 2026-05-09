@@ -30,8 +30,12 @@ THETA0_DEG = 0.0
 THETA_GOAL_DEG = 10.0
 SEED = 0
 
-# LQR duration override.  This keeps your old behavior where you used
-# reference={"duration": 150.2}.  Set None for automatic 4 sec per pi rad.
+# LQR duration override.  This fixes the planning horizon; LQR does not
+# optimize duration.  If not None, this value is used as the externally
+# prescribed horizon.  If None, the horizon is time_horizon(theta0, theta_goal)
+# (automatic 4 sec per pi rad).  Changing this value changes N = round(T / dt)
+# and therefore the generated finite-horizon reference, but duration is not a
+# decision variable in the LQR cost.
 LQR_DURATION_S = 150.2
 
 # Saved-weight folders/files.
@@ -72,7 +76,12 @@ SUBTRACT_GRAVITY_IN_UEQ = False
 NOMINAL_J = 13000.0
 NOMINAL_B = 0.06
 
-# LQR trajectory weights.
+# LQR trajectory-generation weights for the nominal 2-state planner:
+#   x = [theta, omega], u = direct nominal torque/input
+#   sum_k q_theta*(theta_k-theta_goal)^2 + q_omega*omega_k^2 + r_u*u_k^2
+#   + qT_theta*(theta_N-theta_goal)^2 + qT_omega*omega_N^2
+# The planner has no tau_m servo state, no w_time/J_time term, and does not
+# choose duration.  Duration only sets N = round(T / dt).
 LQR_Q_THETA = 85.0
 LQR_Q_OMEGA = 18.0
 LQR_R_U = 0.02
@@ -107,7 +116,12 @@ PP_SMC_LAMBDA = 45.0
 PP_SMC_K = 80.0
 PP_SMC_PHI = 0.05
 
-# Rollout cost used only for reporting total_cost.
+# Closed-loop rollout reporting/evaluation cost weights.
+# This total_cost is computed after theta_ref is generated and tracked by
+# TDE+SMC on the plant.  It is not the finite-horizon LQR planning objective.
+# COST_W_TIME contributes only to rollout reporting/evaluation; it is not used
+# by the LQR planner unless an external optimizer separately treats rollout_once
+# as its objective.
 COST_W_E = 8.0
 COST_W_EDOT = 1.0
 COST_W_U = 0.03
@@ -357,6 +371,8 @@ def build_AB(nom: NominalModel, dt: float) -> Tuple[np.ndarray, np.ndarray]:
     return A, B
 
 def finite_horizon_lqr_gain(A: np.ndarray, B: np.ndarray, N: int, w: LQRWeights) -> List[np.ndarray]:
+    # Finite-horizon nominal LQR objective only: state error and direct input.
+    # There is no duration, w_time, J_time, or actuator servo state in this planner.
     Q = np.diag([w.q_theta, w.q_omega])
     R = np.array([[w.r_u]])
     Qf = np.diag([w.qT_theta, w.qT_omega])
@@ -379,8 +395,11 @@ def generate_reference_ilqr_like(nom: NominalModel, plant_limits: PlantParams, x
         x_tilde = x - x_goal
         excess = abs(x[1]) - plant_limits.omega_max
         if excess > 0:
+            # Speed-limit penalty/heuristic inside trajectory generation.
+            # This is not a duration penalty.
             x_tilde[1] += w.omega_limit_penalty * excess * math.copysign(1.0, x[1])
         u = float((-Ks[k] @ x_tilde.reshape(2, 1)).item())
+        # Planner command saturation; the LQR model itself has no tau_m servo state.
         u = sat(u, plant_limits.u_max)
         x = A @ x + B.flatten() * u
         x_ref[k, :] = x
@@ -392,6 +411,8 @@ def time_horizon(theta0: float, theta_goal: float) -> float:
     return 4.0 * abs(theta_goal - theta0) / math.pi if abs(theta_goal - theta0) > 1e-12 else 0.5
 
 def explicit_lqr_reference(theta0: float, theta_goal: float, plant_p: PlantParams, nom: NominalModel, lqr_w: LQRWeights, duration: Optional[float] = None) -> Tuple[np.ndarray, float]:
+    # Duration is an externally prescribed planning horizon, not an optimized
+    # LQR cost term.  It affects the reference only through N = round(T / dt).
     T = time_horizon(theta0, theta_goal) if duration is None else float(duration)
     N = max(1, int(round(T / plant_p.dt)))
     T = N * plant_p.dt
@@ -816,6 +837,9 @@ def load_rl_reference(theta0: float, theta_goal: float, plant_p: PlantParams, no
 def build_trajectory_reference(trj_type: str, theta0: float, theta_goal: float, plant_p: PlantParams, nom: NominalModel, lqr_w: LQRWeights) -> Optional[Dict[str, object]]:
     kind = str(trj_type).upper()
     if kind == "LQR":
+        # LQR_DURATION_S fixes the horizon when provided.  If it is None,
+        # rollout_once uses time_horizon(theta0, theta_goal).  In both cases,
+        # the LQR planner does not optimize duration; the horizon only sets N.
         if LQR_DURATION_S is None:
             return None
         return {"kind": "LQR", "duration": float(LQR_DURATION_S)}
@@ -953,6 +977,10 @@ def rollout_once(
         pp_eps_dot_log = np.full(N, np.nan)
         pp_violation_log = np.zeros(N)
 
+    # Closed-loop rollout reporting/comparison cost.
+    # This is not the same as the finite-horizon LQR objective used to generate
+    # theta_ref.  J_time appears only here in reporting/evaluation; it is not
+    # part of the LQR planner cost.
     J_e = 0.0
     J_edot = 0.0
     J_omega = 0.0
@@ -1147,7 +1175,7 @@ def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
     final_error = float(theta[-1] - theta_goal)
 
     print(f"Trajectory type = {trj_type}")
-    print(f"Total rollout cost = {logs['metrics']['total_cost']:.6g}")
+    print(f"Total rollout reporting cost = {logs['metrics']['total_cost']:.6g}")
     print(f"Energy metric J_u = {J_u:.6g} N.m^2.s")
     print(f"Final angle error = {final_error:.6f} rad ({math.degrees(final_error):.3f} deg)")
 
@@ -1210,15 +1238,19 @@ def plot_rollout(logs: Dict[str, np.ndarray]) -> None:
 logs_demo = evaluate_and_rollout(TRJ_TYPE)
 print(f"Trajectory type = {TRJ_TYPE}")
 print(f"Reference kind = {logs_demo.get('reference_kind')}")
-print(f"Total cost = {logs_demo['metrics']['total_cost']:.6g}")
+if str(TRJ_TYPE).upper() == "LQR":
+    horizon_source = "LQR_DURATION_S" if LQR_DURATION_S is not None else "time_horizon(theta0, theta_goal)"
+    print(f"LQR planning horizon source = {horizon_source}; duration is fixed before planning and is not optimized by LQR.")
+    print("LQR planning cost has no w_time/J_time term; J_time below is rollout reporting only.")
+print(f"Total rollout reporting cost = {logs_demo['metrics']['total_cost']:.6g}")
 m = logs_demo["metrics"]
 print("\n=== Cost breakdown ===")
 print(f"J_e      = {m['J_e']:.6g}")
 print(f"J_edot   = {m['J_edot']:.6g}")
 print(f"J_omega  = {m['J_omega']:.6g}")
-print(f"J_time   = {m['J_time']:.6g}")
+print(f"J_time (rollout reporting only; not used by LQR planner) = {m['J_time']:.6g}")
 print(f"duration = {m['duration']:.6g} s")
-print(f"total    = {m['total_cost']:.6g}")
+print(f"total rollout reporting cost = {m['total_cost']:.6g}")
 
 
 #%% ========================= PLOT ROLLOUT =========================

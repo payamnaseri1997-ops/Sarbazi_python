@@ -8,6 +8,10 @@ This file trains/loads the SAC actor, but all plant parameters, base LQR
 trajectory, TDE+SMC rollout, and physical simulation are delegated to:
     true_gps_lqr_guided_addon.py -> LQR_TrjOPt_TDESMCwithRLresidual.py
 
+The SAC/GPS reward compares closed-loop rollout objective values.  It is not
+the finite-horizon LQR planning objective: the LQR baseline duration is fixed
+externally, while the SAC/GPS trajectory parameterization may choose duration.
+
 Saved model format:
     save_dir/sac_gps_agent.pt/actor.keras
     save_dir/sac_gps_agent.pt/q1.keras
@@ -479,7 +483,7 @@ def prefill_from_saved_teachers(agent, train_cases, traj_cfg, obj_cfg, sac_cfg, 
         bc_obs.append(obs); bc_act.append(best_action)
         rows.append(dict(case=case, zero_eval=zero_ev, best_eval=best_ev, best_action=best_action, saved_teacher=saved))
         found_cases.append(case.label())
-        print(f"saved teacher {i+1}/{len(train_cases)}: {case.label()} | existing={best_ev['existing_cost']:.6g}, cost={best_ev['cost']:.6g}, improvement={best_ev['improvement_pct']:.2f}%")
+        print(f"saved teacher {i+1}/{len(train_cases)}: {case.label()} | fixed-horizon LQR rollout objective={best_ev['existing_cost']:.6g}, teacher rollout objective={best_ev['cost']:.6g}, improvement={best_ev['improvement_pct']:.2f}%")
     print(f"Saved teacher prefill found {len(found_cases)}/{len(train_cases)} cases.")
     if found_cases:
         print("Cases with saved teachers: " + ", ".join(found_cases))
@@ -850,7 +854,7 @@ def evaluate_sac_gps_policy(agent, test_cases, traj_cfg, obj_cfg, sac_cfg, basel
         zero_ev = evaluate_action(case, zero_action, traj_cfg, obj_cfg, sac_cfg, baseline_cache, seed=seed + 3000 + i)
         best_ev = min([actor_ev, refined_ev, zero_ev], key=lambda d: d["cost"])
         rows.append(dict(case=case, existing_metrics=existing_metrics, existing_logs=existing_logs, existing_ref=existing_ref, existing_T=existing_T, zero_eval=zero_ev, actor_eval=actor_ev, refined_eval=refined_ev, best_eval=best_ev, actor_metrics=actor_ev["metrics"], refined_metrics=refined_ev["metrics"], best_metrics=best_ev["metrics"]))
-        print(f"eval {case.label()}: existing={existing_metrics['total_cost']:.6g}, actor={actor_ev['cost']:.6g}, refined={refined_ev['cost']:.6g}, best={best_ev['cost']:.6g}, best_imp={best_ev['improvement_pct']:.2f}%")
+        print(f"eval {case.label()}: fixed-horizon LQR rollout objective={existing_metrics['total_cost']:.6g}, actor rollout objective={actor_ev['cost']:.6g}, refined rollout objective={refined_ev['cost']:.6g}, best={best_ev['cost']:.6g}, best_imp={best_ev['improvement_pct']:.2f}%")
     return rows
 
 
@@ -877,15 +881,15 @@ def plot_evaluation_summary(rows, obj_cfg, save_dir=None, show=True):
     existing = np.array([r["existing_metrics"]["total_cost"] for r in rows], float)
     actor = np.array([r["actor_eval"]["cost"] for r in rows], float)
     best = np.array([r["best_eval"]["cost"] for r in rows], float)
-    fig = plt.figure(figsize=(max(9,.45*len(rows)),5)); plt.plot(x, existing, marker="o", label="LQR"); plt.plot(x, actor, marker="o", label="SAC actor"); plt.plot(x, best, marker="o", label="best")
-    plt.xticks(x, labels, rotation=60, ha="right"); plt.ylabel("objective cost"); plt.title("Trajectory objective comparison"); plt.grid(True, alpha=.4); plt.legend(); _save_or_show(fig, save_dir, "eval_cost_comparison.png", show)
+    fig = plt.figure(figsize=(max(9,.45*len(rows)),5)); plt.plot(x, existing, marker="o", label="fixed-horizon LQR rollout"); plt.plot(x, actor, marker="o", label="SAC actor"); plt.plot(x, best, marker="o", label="best")
+    plt.xticks(x, labels, rotation=60, ha="right"); plt.ylabel("closed-loop rollout objective cost"); plt.title("Trajectory rollout objective comparison"); plt.grid(True, alpha=.4); plt.legend(); _save_or_show(fig, save_dir, "eval_cost_comparison.png", show)
 
 
 def print_constraint_report(rows, obj_cfg):
     print("\n=== Constraint / improvement report ===")
     for r in rows:
         case = r["case"]; best = r["best_eval"]; m = best["metrics"]
-        print(f"{case.label()}: existing={best['existing_cost']:.6g}, best={best['cost']:.6g}, imp={best['improvement_pct']:.2f}%, max|omega|={m['max_abs_omega']:.4g}/{obj_cfg.omega_limit}, max|tau_m|={m['max_abs_tau_m']:.4g}/{obj_cfg.torque_limit}, max|u|={m['max_abs_u_total']:.4g}/{obj_cfg.command_limit}, final_err={m['final_theta_error']:.4g}")
+        print(f"{case.label()}: fixed-horizon LQR rollout objective={best['existing_cost']:.6g}, best rollout objective={best['cost']:.6g}, imp={best['improvement_pct']:.2f}%, max|omega|={m['max_abs_omega']:.4g}/{obj_cfg.omega_limit}, max|tau_m|={m['max_abs_tau_m']:.4g}/{obj_cfg.torque_limit}, max|u|={m['max_abs_u_total']:.4g}/{obj_cfg.command_limit}, final_err={m['final_theta_error']:.4g}")
 
 
 #%% ========================= USER SETTINGS =========================

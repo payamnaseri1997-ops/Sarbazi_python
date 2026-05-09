@@ -9,6 +9,15 @@ plant, controller, LQR model, or physical parameters.  Every system rollout,
 base LQR trajectory, and TDE+SMC command comes from
 LQR_TrjOPt_TDESMCwithRLresidual.py.
 
+Cost terminology:
+    - The base LQR trajectory uses the fixed-horizon nominal LQR planning
+      objective in the main file.  Its duration is prescribed by
+      LQR_DURATION_S, or by time_horizon(...) when LQR_DURATION_S is None;
+      LQR does not optimize duration and has no w_time/J_time term.
+    - The NN/GPS trajectory objective below is a separate closed-loop rollout
+      objective.  It may include duration because this learned trajectory
+      parameterization chooses duration.
+
 Saved model format is unchanged:
     save_dir/trajectory_policy.pt
     save_dir/training_cases.json
@@ -202,6 +211,9 @@ def build_monotone_reference(
 # ========================= SYSTEM ROLLOUT THROUGH LQR MAIN FILE =========================
 
 def base_lqr_reference(case: CaseSpec, theta0: float = 0.0) -> Tuple[np.ndarray, float]:
+    # Fixed-horizon nominal LQR reference from the main file.  LQR_DURATION_S
+    # prescribes the horizon when set; otherwise time_horizon(...) is used.
+    # The LQR planner does not optimize duration.
     plant_p, nom, lqr_w, _, _ = system_for_case(case)
     return sysmod.explicit_lqr_reference(
         theta0=theta0,
@@ -239,6 +251,10 @@ def simulate_existing_reference(case: CaseSpec, seed: int = 0, theta0: float = 0
 
 
 def trajectory_objective(logs: Dict[str, np.ndarray], theta_goal: float, plant_p, obj_cfg: TrajectoryConstraintConfig) -> Dict[str, float]:
+    # Closed-loop trajectory-learning objective evaluated after rollout.
+    # This is separate from the finite-horizon LQR planning objective used to
+    # generate the baseline theta_ref.  Its duration term belongs to NN/GPS
+    # teacher evaluation, not to the LQR planner.
     required_keys = ("t", "theta", "theta_ref", "omega", "omega_ref", "u_total")
     missing = [k for k in required_keys if k not in logs]
     if missing:
@@ -541,7 +557,7 @@ def evaluate_policy_vs_existing(policy: TrajectoryPolicyNet, cases: Sequence[Cas
         p = policy_params(policy, case)
         rl_metrics, rl_logs, rl_theta_ref, rl_T = evaluate_params_for_case(case, p, traj_cfg, obj_cfg, seed=seed + i)
         rows.append(dict(case=case, existing_metrics=base_metrics, rl_metrics=rl_metrics, existing_logs=base_logs, rl_logs=rl_logs, existing_theta_ref=base_theta_ref, rl_theta_ref=rl_theta_ref, existing_duration=base_T, rl_duration=rl_T, rl_params=p, improvement=base_metrics["total_cost"] - rl_metrics["total_cost"], improvement_ratio=(base_metrics["total_cost"] - rl_metrics["total_cost"]) / max(abs(base_metrics["total_cost"]), 1e-12)))
-        print(f"Eval {case.label()}: existing={base_metrics['total_cost']:.5g}, NN-traj={rl_metrics['total_cost']:.5g}, improvement={rows[-1]['improvement_ratio'] * 100:.1f}%")
+        print(f"Eval {case.label()}: fixed-horizon LQR rollout objective={base_metrics['total_cost']:.5g}, NN-traj rollout objective={rl_metrics['total_cost']:.5g}, improvement={rows[-1]['improvement_ratio'] * 100:.1f}%")
     return rows
 
 
@@ -577,10 +593,10 @@ def plot_evaluation_summary(rows: Sequence[Dict[str, object]], save_dir: Optiona
     learned = np.array([r["rl_metrics"]["total_cost"] for r in rows], dtype=float)
     fig = plt.figure(figsize=(max(10, len(rows) * 0.55), 5))
     width = 0.4
-    plt.bar(x - width/2, existing, width, label="LQR reference")
+    plt.bar(x - width/2, existing, width, label="fixed-horizon LQR rollout")
     plt.bar(x + width/2, learned, width, label="NN/GPS reference")
     plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("objective cost")
+    plt.ylabel("closed-loop rollout objective cost")
     plt.title("Cost comparison")
     plt.legend(); plt.grid(True, axis="y", linestyle="--", alpha=0.6)
     _maybe_save(fig, save_dir, "cost_comparison.png", show)
@@ -726,8 +742,8 @@ improvement = lqr_cost - gps_cost
 improvement_ratio = improvement / max(abs(lqr_cost), 1e-12)
 
 print("\n---------------- RESULTS ----------------")
-print(f"LQR total cost     = {lqr_cost:.6g}")
-print(f"NN/GPS total cost  = {gps_cost:.6g}")
+print(f"Fixed-horizon LQR closed-loop rollout objective cost = {lqr_cost:.6g}")
+print(f"NN/GPS closed-loop rollout objective cost            = {gps_cost:.6g}")
 print(f"Improvement        = {improvement:.6g}")
 print(f"Improvement ratio  = {100.0 * improvement_ratio:.2f} %")
 
