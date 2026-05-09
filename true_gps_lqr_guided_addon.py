@@ -10,6 +10,15 @@ LQR_TrjOPt_TDESMCwithRLresidual.py for:
     - base LQR trajectory
     - TDE+SMC rollout and control command generation
 
+Cost terminology:
+    - The base LQR trajectory uses a fixed, externally prescribed horizon.
+      LQR_DURATION_S sets that horizon when not None; otherwise the main
+      file's time_horizon(...) is used.  The LQR planner does not optimize
+      duration and has no w_time/J_time cost.
+    - The GPS teacher objective in this file is a separate closed-loop rollout
+      objective.  It may penalize duration because the GPS trajectory
+      parameterization includes duration as a decision variable.
+
 Saved files:
     save_dir/true_gps_policy.keras
     save_dir/training_teachers.json
@@ -198,7 +207,9 @@ def _extend_reference_with_goal_hold(
 
 
 def generate_existing_lqr_reference(nom, plant_p, lqr_w, theta0: float, theta_goal: float, dt: float) -> Tuple[np.ndarray, float]:
-    """Wrapper around the LQR main file's base-trajectory function."""
+    """Wrapper around the main file's fixed-horizon LQR reference."""
+    # LQR_DURATION_S prescribes the horizon when set; otherwise the main file
+    # uses time_horizon(...).  The LQR planner does not optimize duration.
     return sysmod.explicit_lqr_reference(
         theta0=theta0,
         theta_goal=theta_goal,
@@ -296,6 +307,9 @@ def simulate_reference(case: GPSCase, theta_ref: np.ndarray, T: float, seed: int
 
 
 def compute_objective(logs: Dict[str, np.ndarray], case: GPSCase, obj: GPSObjectiveConfig, guide_theta_ref: Optional[np.ndarray] = None, guide_T: Optional[float] = None) -> Dict[str, float]:
+    # Closed-loop GPS teacher/evaluation objective, not the LQR planning cost.
+    # Its duration term can shape GPS teachers because GPS chooses trajectory
+    # duration; it is not a duration term in the fixed-horizon LQR planner.
     required_keys = ("t", "theta", "theta_ref", "omega", "omega_ref", "u_total")
     missing = [k for k in required_keys if k not in logs]
     if missing:
@@ -625,10 +639,10 @@ def plot_evaluation_summary(rows: Sequence[Dict[str, object]], save_dir: Optiona
     c_nn = np.array([r["nn_metrics"]["total_cost"] for r in rows])
     c_gps = np.array([r["gps_metrics"]["total_cost"] for r in rows])
     fig = plt.figure(figsize=(max(10, len(rows) * 0.55), 5))
-    plt.bar(x - width, c_existing, width, label="LQR")
+    plt.bar(x - width, c_existing, width, label="fixed-horizon LQR rollout")
     plt.bar(x, c_nn, width, label="policy")
     plt.bar(x + width, c_gps, width, label="GPS refined")
-    plt.xticks(x, labels, rotation=45, ha="right"); plt.ylabel("objective cost"); plt.title("Trajectory objective comparison")
+    plt.xticks(x, labels, rotation=45, ha="right"); plt.ylabel("closed-loop rollout objective cost"); plt.title("Trajectory rollout objective comparison")
     plt.legend(); plt.grid(True, axis="y", linestyle="--", alpha=0.6); _save_or_show(fig, save_dir, "summary_objective_cost.png", show)
 
 
